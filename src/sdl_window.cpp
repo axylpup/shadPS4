@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <SDL3/SDL_events.h>
+#include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_properties.h>
@@ -619,10 +620,11 @@ void WindowSDL::OnKeyboardMouseInput(const SDL_Event* event) {
 
 void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
     // 2026-10-21: a pad without a motion sensor or a touch surface (input/pad_gestures) plays
-    // L3+R3 and View here, before the bindings see them.
+    // L3+R3 and View here, before the bindings see them. Controller 0 only, as the mouse modes.
     SDL_Event filtered = *event;
-    if (const u8 pad = controllers.GetGamepadIndexFromJoystickId(filtered.gbutton.which);
-        pad < 5 && Input::PadGestures::FilterEvent(filtered, controllers[pad])) {
+    SDL_Gamepad* pad = SDL_GetGamepadFromID(filtered.gbutton.which);
+    if (pad != nullptr && pad == controllers[0]->m_sdl_gamepad &&
+        Input::PadGestures::FilterEvent(filtered, controllers[0])) {
         return;
     }
     event = &filtered;

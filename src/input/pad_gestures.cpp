@@ -135,6 +135,7 @@ void StartClick(u64 now) {
     g_click.released = 0;
     g_two = {};
     g_swipe = false;
+    LOG_INFO(Input, "PadGestures: touchpad click (View)");
 }
 
 void StartTwoFingers(u64 now) {
@@ -143,6 +144,7 @@ void StartTwoFingers(u64 now) {
     g_two.released = 0;
     g_click = {}; // two fingers, not a click
     g_swipe = false;
+    LOG_INFO(Input, "PadGestures: two fingers on the touchpad (View + R1)");
 }
 
 void ToggleSensorMode(GameController* controller) {
@@ -164,8 +166,8 @@ void Push(GameController* controller, const Reported& want) {
         return; // the mouse owns the touchpad (Delete): don't fight it
     }
     for (int i = 0; i < 2; ++i) {
-        const bool moved = want.touch[i] &&
-                           (want.x[i] != g_reported.x[i] || want.y[i] != g_reported.y[i]);
+        const bool moved =
+            want.touch[i] && (want.x[i] != g_reported.x[i] || want.y[i] != g_reported.y[i]);
         if (want.touch[i] == g_reported.touch[i] && !moved) {
             continue;
         }
@@ -370,6 +372,9 @@ Uint32 Tick(void* param, Uint32 id, Uint32 interval) {
         // moves with the stick, from the middle toward the side pushed.
         if (g_raw.back &&
             g_raw.right_x * g_raw.right_x + g_raw.right_y * g_raw.right_y > kSwipeStartSq) {
+            if (!g_swipe) {
+                LOG_INFO(Input, "PadGestures: touchpad swipe (View + right stick)");
+            }
             g_swipe = true;
             g_click = {};
         } else if (!g_raw.back) {
