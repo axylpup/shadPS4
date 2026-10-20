@@ -111,15 +111,15 @@ void GameController::Axis(Input::Axis axis, int value, bool smooth) {
 
 void GameController::UpdateGyro(const float gyro[3]) {
     std::lock_guard lock{m_state_mutex};
-    if (m_synth.active) {
-        return; // SHADPS4_SYNTH_MOTION: the mouse is the sensor; a real pad's events are ignored
+    if (SyntheticActiveLocked()) {
+        return; // synthetic motion: the pose is generated; a real pad's events are ignored
     }
     std::memcpy(gyro_buf, gyro, sizeof(gyro_buf));
 }
 
 void GameController::UpdateAcceleration(const float acceleration[3]) {
     std::lock_guard lock{m_state_mutex};
-    if (m_synth.active) {
+    if (SyntheticActiveLocked()) {
         return;
     }
     std::memcpy(accel_buf, acceleration, sizeof(accel_buf));
@@ -127,21 +127,41 @@ void GameController::UpdateAcceleration(const float acceleration[3]) {
 
 void GameController::SetSyntheticMotion(bool active) {
     std::lock_guard lock{m_state_mutex};
-    if (m_synth.active == active) {
+    SetSyntheticSourceLocked(false, active);
+}
+
+void GameController::SetPadSyntheticMotion(bool active) {
+    std::lock_guard lock{m_state_mutex};
+    SetSyntheticSourceLocked(true, active);
+}
+
+void GameController::SetSyntheticSourceLocked(bool pad, bool active) {
+    bool& flag = pad ? m_synth.pad : m_synth.mouse;
+    if (flag == active) {
         return;
     }
+    flag = active;
+    const bool keep_pad = m_synth.pad;
+    const bool keep_mouse = m_synth.mouse;
+    const bool any = keep_pad || keep_mouse;
+    // Toggling a source recentres the pose: aiming starts from the middle of the screen again.
     m_synth = {};
-    m_synth.active = active;
+    m_synth.pad = keep_pad;
+    m_synth.mouse = keep_mouse;
     g_synth_dx.store(0.0f, std::memory_order_relaxed);
     g_synth_dy.store(0.0f, std::memory_order_relaxed);
-    if (!active) {
+    g_synth_pad_yaw.store(0.0f, std::memory_order_relaxed);
+    g_synth_pad_pitch.store(0.0f, std::memory_order_relaxed);
+    g_synth_pad_rattle.store(false, std::memory_order_relaxed);
+    if (!any) {
         m_state.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
         std::fill(gyro_buf, gyro_buf + 3, 0.0f);
         std::fill(accel_buf, accel_buf + 3, 0.0f);
         accel_buf[1] = 9.81f;
     }
     m_last_orientation_update = 0;
-    LOG_INFO(Input, "SynthMotion: mouse motion sensor {}", active ? "ON" : "off");
+    LOG_INFO(Input, "SynthMotion: {} {}", pad ? "pad sensor mode" : "mouse motion sensor",
+             active ? "ON" : "off");
     PushStateLocked();
 }
 
@@ -173,6 +193,15 @@ void GameController::SyntheticMotionLocked(u64 timestamp) {
         s.yaw -= k * dx;
     }
     s.pitch = std::clamp(s.pitch - k * dy, -80.0f * pi / 180.0f, 80.0f * pi / 180.0f);
+    if (s.pad) {
+        // 2026-10-21 (input/pad_gestures): a pad without a gyro aims the stick as a rate, the
+        // sticks' radians arriving from the 4 ms tick. The game's own limit: +-80 degrees of yaw
+        // and +-69 of pitch keep the graffiti cursor on the screen (iss_pc's aim_pitch clamp).
+        s.yaw = std::clamp(s.yaw + g_synth_pad_yaw.exchange(0.0f, std::memory_order_relaxed),
+                           -1.5f, 1.5f);
+        s.pitch = std::clamp(s.pitch + g_synth_pad_pitch.exchange(0.0f, std::memory_order_relaxed),
+                             -1.2f, 1.2f);
+    }
     if (s.yaw > pi) {
         s.yaw -= 2.0f * pi;
     } else if (s.yaw < -pi) {
@@ -186,8 +215,11 @@ void GameController::SyntheticMotionLocked(u64 timestamp) {
                          : 0.0f;
     const bool rattle = g_synth_rattle.load(std::memory_order_relaxed) ||
                         g_synth_rattle_btn.load(std::memory_order_relaxed) ||
+                        g_synth_pad_rattle.load(std::memory_order_relaxed) ||
                         SDL_GetTicks() < g_synth_rattle_until.load(std::memory_order_relaxed);
-    const bool tilt = rattle || g_synth_tilt.load(std::memory_order_relaxed) ||
+    // The pad's sensor mode holds the pad on its side, as the graffiti scene asks ("Hold Wireless
+    // Controller Sideways"): the roll is part of the mode, not a button.
+    const bool tilt = rattle || s.pad || g_synth_tilt.load(std::memory_order_relaxed) ||
                       g_synth_tilt_btn.load(std::memory_order_relaxed);
     // Roll toward 90 degrees while tilted (eased over ~80 ms: a turn, not a jump).
     const float target = tilt ? pi * 0.5f : 0.0f;
@@ -309,7 +341,7 @@ void GameController::PushStateLocked(u64 timestamp) {
         timestamp = Libraries::Kernel::sceKernelGetProcessTime();
     }
     m_state.UpdateAxisSmoothing(timestamp);
-    if (m_synth.active) [[unlikely]] {
+    if (SyntheticActiveLocked()) [[unlikely]] {
         SyntheticMotionLocked(timestamp);
     } else {
         m_state.OnGyro(gyro_buf);

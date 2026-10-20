@@ -61,6 +61,12 @@ inline std::atomic<bool> g_synth_rattle{false};     ///< R held
 inline std::atomic<u64> g_synth_rattle_until{0};
 inline std::atomic<bool> g_synth_tilt_btn{false};   ///< mouse forward button held
 inline std::atomic<bool> g_synth_rattle_btn{false}; ///< mouse back button held
+/// 2026-10-21: a pad without a gyro reports its motion from its own sticks (input/pad_gestures):
+/// the aim rates are radians accumulated since the last 4 ms push (Second Son's graffiti can),
+/// the rattle is the face button held, and SetPadSyntheticMotion rolls the pose 90 degrees.
+inline std::atomic<float> g_synth_pad_yaw{0.0f};
+inline std::atomic<float> g_synth_pad_pitch{0.0f};
+inline std::atomic<bool> g_synth_pad_rattle{false};
 
 enum class Axis {
     LeftX = 0,
@@ -146,6 +152,9 @@ public:
     void ResetOrientation();
     /// SHADPS4_SYNTH_MOTION: turns the mouse motion source on / off (F6 Gyro mode).
     void SetSyntheticMotion(bool active);
+    /// 2026-10-21: the same pose from a pad's sticks (input/pad_gestures, L3+R3 on a pad without
+    /// a gyro). The two sources are independent: the pose is synthetic while either is on.
+    void SetPadSyntheticMotion(bool active);
     void SetLightBarRGB(u8 const r, u8 const g, u8 const b);
     void SetLightBarRGB(Colour const c);
     Colour GetLightBarRGB();
@@ -160,12 +169,17 @@ public:
 private:
     /// SHADPS4_SYNTH_MOTION state (m_state_mutex).
     struct SyntheticMotion {
-        bool active{};
+        bool mouse{}; ///< F6 / SHADPS4_SYNTH_MOTION: the mouse is the sensor
+        bool pad{};   ///< the pad's sensor mode: its sticks aim, always rolled on its side
         float yaw{}, pitch{}, roll{}, phi{};
         u64 t0{}, last_t{};
         Libraries::Pad::OrbisFQuaternion last_q{0.0f, 0.0f, 0.0f, 1.0f};
     };
     SyntheticMotion m_synth{};
+    bool SyntheticActiveLocked() const {
+        return m_synth.mouse || m_synth.pad;
+    }
+    void SetSyntheticSourceLocked(bool pad, bool active);
     void SyntheticMotionLocked(u64 timestamp);
 
     // m_state_mutex must be held by the caller.
