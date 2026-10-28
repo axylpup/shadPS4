@@ -327,7 +327,9 @@ for this build only - problems with other games or the official shadPS4 builds b
 
 This build is free and always will be - no paid builds, no early access. If you'd like to chip in,
 [GitHub Sponsors](https://github.com/sponsors/axylpup) helps cover the AI subscription that writes the code (about
-$100 a month; GitHub takes no fee). You still need your own copy of the game; no game files are included.
+$100 a month; GitHub takes no fee). Anything beyond that buys test hardware like players actually own - first an
+entry-level AMD graphics card, since AMD-only problems are hard to fix without one. You still need your own copy of
+the game; no game files are included.
 
 ## How this was made
 
