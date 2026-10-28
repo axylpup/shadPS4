@@ -323,6 +323,12 @@ for this build only - problems with other games or the official shadPS4 builds b
 
 </details>
 
+## Support
+
+This build is free and always will be - no paid builds, no early access. If you'd like to chip in,
+[GitHub Sponsors](https://github.com/sponsors/axylpup) helps cover the AI subscription that writes the code (about
+$100 a month; GitHub takes no fee). You still need your own copy of the game; no game files are included.
+
 ## How this was made
 
 This build was made with AI. I'm a 3D artist, not a programmer: I directed the project - set the goals, chose what to
@@ -334,6 +340,7 @@ tests and measurements and most of the documentation were written by AI models: 
 ## Credits and licence
 
 Directed and tested by Axylpup - code by AI (mostly Claude Opus 5.5, Anthropic) - built on
-[shadPS4](https://github.com/shadps4-emu/shadPS4), thanks to its team and contributors. GPL-2.0-or-later.
+[shadPS4](https://github.com/shadps4-emu/shadPS4), thanks to its team and contributors - you can support them on
+[Ko-fi](https://ko-fi.com/shadps4). GPL-2.0-or-later.
 NVIDIA Streamline headers are MIT; the DLSS runtime files are NVIDIA's and come from your own download. inFAMOUS
 Second Son (c) Sony Interactive Entertainment / Sucker Punch Productions.
