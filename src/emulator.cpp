@@ -52,7 +52,9 @@
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "video_core/cache_storage.h"
+#include "video_core/native_census.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 
 #ifdef _WIN32
 #include <WinSock2.h>
@@ -611,6 +613,21 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // Initialize patcher
     if (!id.empty()) {
         MemoryPatcher::g_game_serial = id;
+    }
+    // SHADPS4_NATIVE_COLOUR (the release flags) was tuned on Second Son only: on First Light
+    // (CUSA00575 / CUSA00897, 2026-10-26) its colour variants turn every shadowed side black (the
+    // ambient light is lost; found by halving the release flags). Off there, before the renderer.
+    if (VideoCore::g_native_colour && (id == "CUSA00575" || id == "CUSA00897")) {
+        VideoCore::g_native_colour = false;
+        LOG_INFO(Loader, "SHADPS4_NATIVE_COLOUR: off for First Light (black shadows with it)");
+    }
+    // First Light's film grain (2026-10-26): fs_7569e7b0 draws the hash-noise grain over the
+    // picture (always in the pause menu); its draws are skipped like SHADPS4_SKIP_PS (found by
+    // skipping the noise programs of all_shaders.xpps one by one). SHADPS4_FILM_GRAIN=1 keeps it.
+    const char* grain_env = std::getenv("SHADPS4_FILM_GRAIN");
+    if ((id == "CUSA00575" || id == "CUSA00897") && !(grain_env && grain_env[0] == '1')) {
+        Vulkan::Dlss::SkipPsHashes().push_back(0x7569e7b0);
+        LOG_INFO(Loader, "First Light: film grain off (SHADPS4_FILM_GRAIN=1 keeps it)");
     }
 
     // Extract and load trophies.

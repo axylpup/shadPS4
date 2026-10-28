@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 #include "common/logging/log.h"
 #include "common/types.h"
@@ -205,21 +206,60 @@ inline void NoteTapInfo(ShaderTap& tap, const Shader::Info& info, VAddr base) {
 }
 
 /// The pipeline lookup's Info sites: the weights CB and the two input taps.
-/// SHADPS4_SKIP_PS=<hex hash> (test, 10-21): draws with this pixel shader are skipped, e.g.
-/// 204f45fe = the screen-space reflection ray march (study-delsin-mv-ssr-2026-10-21).
-inline std::atomic<u64> g_skip_ps{0};
-inline u64 SkipPsHash() {
-    static const u64 hash = [] {
-        const char* v = std::getenv("SHADPS4_SKIP_PS");
-        return v ? std::strtoull(v, nullptr, 16) : 0ull;
+/// SHADPS4_SKIP_PS=<hex hash>[,<hex hash>...] (test, 10-21): draws with these pixel shaders are
+/// skipped, e.g. 204f45fe = the screen-space reflection ray march (study-delsin-mv-ssr-2026-10-21).
+/// A list and every guest copy of each program (10-26, First Light's film grain search: the game
+/// loads some programs at two addresses).
+constexpr size_t MaxSkipPs = 16;
+inline std::array<std::atomic<u64>, MaxSkipPs> g_skip_ps{};
+inline std::atomic<u32> g_skip_ps_count{0};
+/// The hashes skipped; emulator.cpp adds a game's own (First Light's film grain) before the
+/// renderer starts, so the list is read-only once draws run.
+inline std::vector<u64>& SkipPsHashes() {
+    static std::vector<u64> hashes = [] {
+        std::vector<u64> out;
+        if (const char* v = std::getenv("SHADPS4_SKIP_PS")) {
+            for (const char* p = v; *p;) {
+                char* end = nullptr;
+                const u64 h = std::strtoull(p, &end, 16);
+                if (end == p) {
+                    break;
+                }
+                out.push_back(h);
+                p = *end == ',' ? end + 1 : end;
+            }
+        }
+        return out;
     }();
-    return hash;
+    return hashes;
+}
+
+inline bool IsSkippedPs(VAddr ps_address) {
+    const u32 n = g_skip_ps_count.load(std::memory_order_acquire);
+    for (u32 i = 0; i < n; ++i) {
+        if (g_skip_ps[i].load(std::memory_order_relaxed) == ps_address) {
+            return true;
+        }
+    }
+    return false;
 }
 
 inline void NoteShaderInfo(const Shader::Info& info, VAddr base) {
-    if (info.stage == Shader::Stage::Fragment && SkipPsHash() != 0 &&
-        info.pgm_hash == SkipPsHash()) [[unlikely]] {
-        g_skip_ps.store(base, std::memory_order_relaxed);
+    if (info.stage == Shader::Stage::Fragment && !SkipPsHashes().empty() &&
+        std::ranges::find(SkipPsHashes(), info.pgm_hash) != SkipPsHashes().end()) [[unlikely]] {
+        static std::mutex skip_mutex;
+        std::scoped_lock lock{skip_mutex};
+        const u32 n = g_skip_ps_count.load(std::memory_order_relaxed);
+        bool known = false;
+        for (u32 i = 0; i < n; ++i) {
+            known = known || g_skip_ps[i].load(std::memory_order_relaxed) == base;
+        }
+        if (!known && n < MaxSkipPs) {
+            g_skip_ps[n].store(base, std::memory_order_relaxed);
+            g_skip_ps_count.store(n + 1, std::memory_order_release);
+            LOG_INFO(Render_Vulkan, "SHADPS4_SKIP_PS: fs_{:08x} at {:#x} skipped", info.pgm_hash,
+                     base);
+        }
     }
     if (info.stage != Shader::Stage::Fragment || !Enabled()) [[likely]] {
         return;

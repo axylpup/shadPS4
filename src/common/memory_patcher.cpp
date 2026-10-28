@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -47,11 +48,65 @@ static bool g_particle_late_read_applied = false; // V1 written (ApplyParticleLi
 
 // GitHub #22 (2026-10-22): every built-in patch and game-memory reader in this file uses eboot
 // 01.07 offsets. A US 01.00 eboot (CUSA00223, code hash 0xc8fba35195996bbd) loads its code at
-// +0x400000, so +0x3ee160 was not mapped and the first byte compare crashed at boot. g_eboot_107
+// +0x400000, so +0x3ee160 was not mapped and the first byte compare crashed at boot. g_layout
 // is decided once in OnGameLoaded (the offsets inside loaded segments + anchor bytes); everything
 // below checks it first. Not the code hash: a 01.07 copy with another hash (i24) runs the patches.
 static std::vector<std::pair<uintptr_t, u64>> g_eboot_segments;
-static bool g_eboot_107 = false;
+
+// inFAMOUS First Light (2026-10-26): the standalone CUSA00575 / CUSA00897 (01.04, code hash
+// 0x9b94fdbae3a6f151) is the same engine built later - its code and globals moved, the renderer
+// object and the camera kept their layout (the mode toggle's field offsets are byte-identical).
+// The sites below were found from 01.07's by masked instruction signatures (rip-relative and branch
+// displacements masked; each one unique) and are byte-compared before any write, as on 01.07.
+// First Light's main loop, particle code and streamer differ: the particle, house-split and
+// performance patches stay Second Son only (second_son).
+struct EbootLayout {
+    const char* name;
+    bool second_son;
+    u64 light_list;    // imul esi, r15d, 0x320000 (imm at +3); mov r8d, 0x320000 at +0x19
+    u64 two_load;      // the projection builder's vmovss xmm3, [rip + 2.0]
+    u32 two_disp;      // its disp32
+    u64 pad;           // 4 never-executed padding bytes before that function
+    u64 size_imms[8];  // render w / h, output w / h, 2D screen space w / h, mode toggle w / h
+    u64 movie_k;       // the movie draw's 16.0, 9.0
+    u64 movie_rect;    // its quad (-1, -1, 1, 1)
+    u64 renderer;      // the renderer object (mode bytes and size table, see Renderer*)
+    u64 hud_floor[3];  // the safe-area floor loads (size setup and two refreshes)
+    u64 hud_ymul[3];   // their vmulss H * r
+    u64 jitter_a;      // the y numerator load (x numerator at +8, the parity jz at +0x22)
+    u64 jitter_b;      // the first SMAA subsample-index load (the second at +0xa)
+    u32 jitter_disp[4]; // their original disp32: y, x numerator, index 1, index 2
+    u64 camera_ptr;    // the main camera object pointer
+    u64 metering_size[4];  // the exposure metering buffers' mov esi, 0x9c4 (0 = not patched)
+    u64 metering_count[4]; // their mov ecx, 0x271 (the V#'s 625 records)
+};
+
+constexpr EbootLayout SecondSon107{
+    "Second Son 01.07", true, 0x16be04, 0x581d10, 0x562798, 0x581c84,
+    {0x1eff4a, 0x1eff51, 0x1eff57, 0x1eff5e, 0x1f0403, 0x1f03fb, 0x1f0d3e, 0x1f0d4d},
+    0xaadbe0, 0xaadd60, 0xf1bcd0, {0x1f042f, 0x1f2aae, 0x1f2bae}, {0x1f0471, 0x1f2afb, 0x1f2bfb},
+    0x472976, 0x47223c, {0x0063c6aa, 0x0063c6a6, 0x0063cd6c, 0x0063cd52}, 0x7f2d2b8,
+};
+constexpr EbootLayout FirstLight104{
+    "First Light 01.04", false, 0x190694, 0x65c4f0, 0x576a70, 0x65c464,
+    {0x2369da, 0x2369e1, 0x2369e7, 0x2369ee, 0x236e93, 0x236e8b, 0x2377ce, 0x2377dd},
+    0xb9c0c0, 0xb9c240, 0x11362d0, {0x236ebf, 0x23954e, 0x23964e}, {0x236f01, 0x23959b, 0x23969b},
+    0x51c9ad, 0x51c26c, {0x00680b93, 0x00680b8f, 0x0068125c, 0x00681242}, 0x81a3f98,
+    {0x19767a, 0x1976c4, 0x198680, 0x1986c7}, {0x19769e, 0x1976e8, 0x1986a3, 0x1986ea},
+};
+// Renderer fields (the same in both): the stored / wanted colour option bytes, the size table, the
+// quality level.
+constexpr u64 RendererStoredOption = 0xdf0f06;
+constexpr u64 RendererWantedOption = 0xdf0f11;
+constexpr u64 RendererSizeTable = 0xdf0f14;
+constexpr u64 RendererQualityLevel = 0x1dca8;
+
+// The layout of the loaded eboot, decided once in OnGameLoaded; nullptr = the built-in patches off.
+static const EbootLayout* g_layout = nullptr;
+
+static bool SecondSon107Loaded() {
+    return g_layout == &SecondSon107;
+}
 
 void AddEbootSegment(uintptr_t address, uint64_t size) {
     g_eboot_segments.emplace_back(address, size);
@@ -64,17 +119,30 @@ static bool EbootRangeLoaded(u64 offset, u64 size) {
     });
 }
 
-static bool DetectEboot107() {
-    // The lowest and highest code offsets the patches touch (0x16be04 light list ... 0x581d18
-    // projection) and the highest data offset (0x7f2d2c0, the main camera pointer).
-    if (!EbootRangeLoaded(0x16be04, 0x581d18 - 0x16be04) || !EbootRangeLoaded(0x7f2d2b8, 8)) {
+static bool LayoutMatches(const EbootLayout& l) {
+    // The lowest and highest code-segment offsets the patches touch (the light list ... the movie
+    // quad) and the highest data offset (the main camera pointer).
+    if (!EbootRangeLoaded(l.light_list, l.movie_rect + 16 - l.light_list) ||
+        !EbootRangeLoaded(l.camera_ptr, 8)) {
         return false;
     }
     // Anchors: the light list's imul esi, r15d, 0x320000 and the projection's 2.0 load.
     static constexpr u8 imul[7] = {0x41, 0x69, 0xf7, 0x00, 0x00, 0x32, 0x00};
-    static constexpr u8 two_load[8] = {0xc5, 0xfa, 0x10, 0x1d, 0x98, 0x27, 0x56, 0x00};
-    return std::memcmp(reinterpret_cast<const void*>(g_eboot_address + 0x16be04), imul, 7) == 0 &&
-           std::memcmp(reinterpret_cast<const void*>(g_eboot_address + 0x581d10), two_load, 8) == 0;
+    u8 two_load[8] = {0xc5, 0xfa, 0x10, 0x1d};
+    std::memcpy(two_load + 4, &l.two_disp, 4);
+    return std::memcmp(reinterpret_cast<const void*>(g_eboot_address + l.light_list), imul, 7) ==
+               0 &&
+           std::memcmp(reinterpret_cast<const void*>(g_eboot_address + l.two_load), two_load, 8) ==
+               0;
+}
+
+static const EbootLayout* DetectLayout() {
+    for (const EbootLayout* l : {&SecondSon107, &FirstLight104}) {
+        if (LayoutMatches(*l)) {
+            return l;
+        }
+    }
+    return nullptr;
 }
 
 std::string toHex(u64 value, size_t byteSize) {
@@ -542,21 +610,57 @@ void ApplyLightListCapacity(RenderSize max) {
     }
     const u32 entries = u32((need + 0xffff) & ~u64(0xffff));
     const auto at = [](u64 offset) { return reinterpret_cast<u8*>(g_eboot_address + offset); };
-    static constexpr u8 imul_head[3] = {0x41, 0x69, 0xf7}; // imul esi, r15d, imm32 (0x16be04)
-    static constexpr u8 mov_head[2] = {0x41, 0xb8};        // mov r8d, imm32 (0x16be1d)
+    const u64 imul_at = g_layout->light_list; // 0x16be04 on 01.07
+    const u64 mov_at = imul_at + 0x19;
+    static constexpr u8 imul_head[3] = {0x41, 0x69, 0xf7}; // imul esi, r15d, imm32
+    static constexpr u8 mov_head[2] = {0x41, 0xb8};        // mov r8d, imm32
     u32 imul_imm = 0, mov_imm = 0;
-    std::memcpy(&imul_imm, at(0x16be07), 4);
-    std::memcpy(&mov_imm, at(0x16be1f), 4);
-    if (std::memcmp(at(0x16be04), imul_head, 3) != 0 || std::memcmp(at(0x16be1d), mov_head, 2) != 0 ||
+    std::memcpy(&imul_imm, at(imul_at + 3), 4);
+    std::memcpy(&mov_imm, at(mov_at + 2), 4);
+    if (std::memcmp(at(imul_at), imul_head, 3) != 0 || std::memcmp(at(mov_at), mov_head, 2) != 0 ||
         imul_imm != Original || mov_imm != Original) {
-        LOG_ERROR(Loader, "Light list: refused, FUN_80016bd10 differs (eboot 01.07 only) - "
-                          "sizes above 3200x1800 may hang the GPU");
+        LOG_ERROR(Loader, "Light list: refused, FUN_80016bd10 differs ({}) - sizes above "
+                          "3200x1800 may hang the GPU",
+                  g_layout->name);
         return;
     }
-    std::memcpy(at(0x16be07), &entries, 4);
-    std::memcpy(at(0x16be1f), &entries, 4);
+    std::memcpy(at(imul_at + 3), &entries, 4);
+    std::memcpy(at(mov_at + 2), &entries, 4);
     LOG_INFO(Loader, "Light list: {} entries for {}x{} ({} tiles; the game's own fits 25,600)",
              entries, max.width, max.height, tiles);
+}
+
+// First Light above 3200x1800 (2026-10-26, user: dark after the pause from 84% of a 4K screen,
+// fine at 83%): the exposure metering cs_a8b68717 reduces 128x72 pixels per workgroup to one float
+// in a buffer of 625 (0x9c4 bytes: 25 x 25 groups = 3200x1800, the Pro size). 3232x1816 needs
+// 26 x 26 = 676 and the extra results ran over into the next buffer. Its four buffers (two
+// setups, one per frame parity each) get the boot size M's group count: the allocation and the
+// V#'s record count are two immediates per buffer.
+void ApplyMeteringCapacity(RenderSize max) {
+    constexpr u32 Original = 625;
+    const u32 groups = ((max.width + 127) / 128) * ((max.height + 71) / 72);
+    if (groups <= Original || g_layout->metering_size[0] == 0) {
+        return;
+    }
+    const auto at = [](u64 offset) { return reinterpret_cast<u8*>(g_eboot_address + offset); };
+    static constexpr u8 size_insn[5] = {0xbe, 0xc4, 0x09, 0x00, 0x00};  // mov esi, 0x9c4
+    static constexpr u8 count_insn[5] = {0xb9, 0x71, 0x02, 0x00, 0x00}; // mov ecx, 0x271
+    for (size_t i = 0; i < 4; ++i) {
+        if (std::memcmp(at(g_layout->metering_size[i]), size_insn, 5) != 0 ||
+            std::memcmp(at(g_layout->metering_count[i]), count_insn, 5) != 0) {
+            LOG_ERROR(Loader, "Exposure metering: refused, buffer {} setup differs ({}) - the "
+                              "picture may darken after the pause above 3200x1800",
+                      i, g_layout->name);
+            return;
+        }
+    }
+    const u32 bytes = groups * 4;
+    for (size_t i = 0; i < 4; ++i) {
+        std::memcpy(at(g_layout->metering_size[i] + 1), &bytes, 4);
+        std::memcpy(at(g_layout->metering_count[i] + 1), &groups, 4);
+    }
+    LOG_INFO(Loader, "Exposure metering: {} results for {}x{} (the game's own fit 625)", groups,
+             max.width, max.height);
 }
 
 } // namespace
@@ -630,11 +734,12 @@ static void ApplyMovieFit(u32 sw, u32 sh) {
     }
     static constexpr float k_orig[2] = {16.0f, 9.0f};
     static constexpr float rect_orig[4] = {-1.0f, -1.0f, 1.0f, 1.0f};
-    auto* k = reinterpret_cast<float*>(g_eboot_address + 0xaadbe0);
-    auto* rect = reinterpret_cast<float*>(g_eboot_address + 0xaadd60);
+    auto* k = reinterpret_cast<float*>(g_eboot_address + g_layout->movie_k);
+    auto* rect = reinterpret_cast<float*>(g_eboot_address + g_layout->movie_rect);
     if (std::memcmp(k, k_orig, sizeof(k_orig)) != 0 ||
         std::memcmp(rect, rect_orig, sizeof(rect_orig)) != 0) {
-        LOG_ERROR(Loader, "Movie fit: refused, the movie draw's constants differ (eboot 01.07)");
+        LOG_ERROR(Loader, "Movie fit: refused, the movie draw's constants differ ({})",
+                  g_layout->name);
         return;
     }
     const float x = f < 1.0 ? float(f) : 1.0f;
@@ -731,12 +836,15 @@ static void ApplyAspectRatio() {
     // function (0x581c84, after a ret: never executed). With the camera aspect = the screen's
     // (screen space below), tanX x k = the 16:9 tanX, tanY x k = the taller view.
     const bool add_vertical = narrow && mode != "crop";
-    static constexpr u8 two_load[8] = {0xc5, 0xfa, 0x10, 0x1d, 0x98, 0x27, 0x56, 0x00};
+    u8 two_load[8] = {0xc5, 0xfa, 0x10, 0x1d};
+    std::memcpy(two_load + 4, &g_layout->two_disp, 4);
     static constexpr u8 pad[4] = {0x90, 0x90, 0x90, 0x90};
     if (add_vertical &&
-        (std::memcmp(reinterpret_cast<const void*>(g_eboot_address + 0x581d10), two_load, 8) != 0 ||
-         std::memcmp(reinterpret_cast<const void*>(g_eboot_address + 0x581c84), pad, 4) != 0)) {
-        LOG_ERROR(Loader, "SHADPS4_ASPECT: refused, the projection builder differs (eboot 01.07)");
+        (std::memcmp(reinterpret_cast<const void*>(g_eboot_address + g_layout->two_load), two_load,
+                     8) != 0 ||
+         std::memcmp(reinterpret_cast<const void*>(g_eboot_address + g_layout->pad), pad, 4) != 0)) {
+        LOG_ERROR(Loader, "SHADPS4_ASPECT: refused, the projection builder differs ({})",
+                  g_layout->name);
         return;
     }
     // Multiples of 8; wide: the height h0 (1080), narrow: its 16:9 width (1920); at most 32:9
@@ -759,35 +867,28 @@ static void ApplyAspectRatio() {
     }
     const u32 sw = u32(std::lround(w * hud_scale));
     const u32 sh = u32(std::lround(h * hud_scale));
-    struct Imm {
-        u64 offset;
-        u32 original;
-        bool width;
-        bool screen_space;
-    };
-    // Eboot 01.07 offsets (byte-compared before any write; FUN_8001eff00, FUN_8001f0be0).
-    static constexpr Imm imms[] = {
-        {0x1eff4a, 0x780, true, false},  {0x1eff51, 0x438, false, false}, // render size
-        {0x1eff57, 0x780, true, false},  {0x1eff5e, 0x438, false, false}, // output size
-        {0x1f0403, 0x780, true, true},   {0x1f03fb, 0x438, false, true},  // 2D screen space
-        {0x1f0d3e, 0x780, true, false},  {0x1f0d4d, 0x438, false, false}, // mode toggle
-    };
-    for (const auto& imm : imms) {
+    // FUN_8001eff00 (render, output, 2D screen space) and FUN_8001f0be0 (the mode toggle), in
+    // g_layout->size_imms' order; byte-compared before any write.
+    const auto& offsets = g_layout->size_imms;
+    for (size_t i = 0; i < std::size(offsets); ++i) {
+        const u32 original = i % 2 == 0 ? 0x780 : 0x438; // width 1920, height 1080
         u32 live;
-        std::memcpy(&live, reinterpret_cast<const void*>(g_eboot_address + imm.offset), 4);
-        if (live != imm.original) {
+        std::memcpy(&live, reinterpret_cast<const void*>(g_eboot_address + offsets[i]), 4);
+        if (live != original) {
             LOG_ERROR(Loader, "SHADPS4_ASPECT: refused, eboot+{:#x} holds {:#x} (not {:#x})",
-                      imm.offset, live, imm.original);
+                      offsets[i], live, original);
             return;
         }
     }
     // The size setup (render, output) allocates at M; the mode toggle loads S.
-    for (const auto& imm : imms) {
-        const bool toggle = imm.offset >= 0x1f0d3e;
-        const u32 value = imm.screen_space ? (imm.width ? sw : sh)
-                          : toggle         ? (imm.width ? w : h)
-                                           : (imm.width ? max.width : max.height);
-        std::memcpy(reinterpret_cast<void*>(g_eboot_address + imm.offset), &value, 4);
+    for (size_t i = 0; i < std::size(offsets); ++i) {
+        const bool width = i % 2 == 0;
+        const bool screen_space = i == 4 || i == 5;
+        const bool toggle = i >= 6;
+        const u32 value = screen_space ? (width ? sw : sh)
+                          : toggle     ? (width ? w : h)
+                                       : (width ? max.width : max.height);
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + offsets[i]), &value, 4);
     }
     g_render_w = w;
     g_render_h = h;
@@ -796,6 +897,7 @@ static void ApplyAspectRatio() {
     g_max = max;
     g_live_ok = live;
     ApplyLightListCapacity(max);
+    ApplyMeteringCapacity(max);
     if (max.width != w || max.height != h) {
         // The renderer's init zeroes the mode bytes after these patches (study d2): the first
         // sceGnmSubmitDone switches the game from M to S.
@@ -803,9 +905,10 @@ static void ApplyAspectRatio() {
     }
     if (add_vertical) {
         const float two_over_k = float(2.0 / (base / aspect));
-        std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x581c84), &two_over_k, 4);
-        const s32 disp = s32(0x581c84 - (0x581d10 + 8)); // rip-relative from the next instruction
-        std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x581d10 + 4), &disp, 4);
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + g_layout->pad), &two_over_k, 4);
+        // rip-relative from the next instruction
+        const s32 disp = s32(s64(g_layout->pad) - s64(g_layout->two_load + 8));
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + g_layout->two_load + 4), &disp, 4);
     }
     ApplyMovieFit(sw, sh);
     LOG_INFO(Loader, "SHADPS4_ASPECT: the game renders {}x{} (aspect {:.3f}, screen {}x{}, "
@@ -892,11 +995,13 @@ s64 MsSinceLiveResize() {
 
 namespace {
 
-/// Writes S into the mode toggle's two imm32 (0x1f0d3e esi = width, 0x1f0d4d edi = height).
+/// Writes S into the mode toggle's two imm32 (01.07: 0x1f0d3e esi = width, 0x1f0d4d edi = height).
 bool WriteToggleSize(u32 w, u32 h) {
-    u8* const imm_w = reinterpret_cast<u8*>(g_eboot_address + 0x1f0d3e);
-    u8* const imm_h = reinterpret_cast<u8*>(g_eboot_address + 0x1f0d4d);
-    constexpr size_t span = 0x1f0d4d + 4 - 0x1f0d3e; // one page
+    const u64 toggle_w = g_layout->size_imms[6];
+    const u64 toggle_h = g_layout->size_imms[7];
+    u8* const imm_w = reinterpret_cast<u8*>(g_eboot_address + toggle_w);
+    u8* const imm_h = reinterpret_cast<u8*>(g_eboot_address + toggle_h);
+    const size_t span = toggle_h + 4 - toggle_w; // within a page on both layouts
 #ifdef _WIN32
     DWORD old = 0;
     if (!VirtualProtect(imm_w, span, PAGE_EXECUTE_READWRITE, &old)) {
@@ -917,10 +1022,12 @@ bool WriteToggleSize(u32 w, u32 h) {
 // wanted one (+0xdf0f11): the toggle's compare at 0x1f0d0a fails, its change block re-sizes
 // everything to S and stores the right byte back (study sec. 3, the quietest of the three).
 volatile u8* StoredOption() {
-    return reinterpret_cast<volatile u8*>(g_eboot_address + 0x1d0cbd6);
+    return reinterpret_cast<volatile u8*>(g_eboot_address + g_layout->renderer +
+                                          RendererStoredOption);
 }
 u8 WantedOption() {
-    return *reinterpret_cast<const volatile u8*>(g_eboot_address + 0x1d0cbe1);
+    return *reinterpret_cast<const volatile u8*>(g_eboot_address + g_layout->renderer +
+                                                 RendererWantedOption);
 }
 
 } // namespace
@@ -942,14 +1049,20 @@ struct CodeEdit {
     u32 slot_off;  // for disp32: the slot byte the load reads
     u32 original;  // the original disp32 / 2 bytes (little endian)
 };
-// Measured bytes (study sec. 3): A1 y numerator, A2 x numerator, A3 jz -> nop, B1 / B2 SMAA index.
-constexpr CodeEdit JitterEdits[] = {
-    {0x47297a, 4, 0x47297e, 4, 0x0063c6aa},
-    {0x472982, 4, 0x472986, 0, 0x0063c6a6},
-    {0x472998, 2, 0, 0, 0x0674},
-    {0x472240, 4, 0x472244, 8, 0x0063cd6c},
-    {0x47224a, 4, 0x47224e, 8, 0x0063cd52},
-};
+// Measured bytes (study sec. 3): A1 y numerator, A2 x numerator, A3 jz -> nop, B1 / B2 SMAA index
+// (01.07: A1 0x47297a, A2 0x472982, A3 0x472998, B1 0x472240, B2 0x47224a).
+std::array<CodeEdit, 5> JitterEdits() {
+    const u64 a = g_layout->jitter_a;
+    const u64 b = g_layout->jitter_b;
+    const auto& d = g_layout->jitter_disp;
+    return {{
+        {a + 0x4, 4, a + 0x8, 4, d[0]},
+        {a + 0xc, 4, a + 0x10, 0, d[1]},
+        {a + 0x22, 2, 0, 0, 0x0674},
+        {b + 0x4, 4, b + 0x8, 8, d[2]},
+        {b + 0xe, 4, b + 0x12, 8, d[3]},
+    }};
+}
 // Whole-instruction guards (the opcode bytes before each disp32).
 constexpr u8 GuardA1[] = {0xc5, 0xfa, 0x10, 0x05};
 constexpr u8 GuardA2[] = {0xc5, 0xfa, 0x10, 0x15};
@@ -977,11 +1090,13 @@ bool WriteCodeBytes(u64 offset, const void* data, size_t size) {
 
 bool JitterBytesOriginal() {
     const auto at = [](u64 off) { return reinterpret_cast<const u8*>(g_eboot_address + off); };
-    if (std::memcmp(at(0x472976), GuardA1, 4) != 0 || std::memcmp(at(0x47297e), GuardA2, 4) != 0 ||
-        std::memcmp(at(0x47223c), GuardB, 4) != 0 || std::memcmp(at(0x472246), GuardB, 4) != 0) {
+    const u64 a = g_layout->jitter_a;
+    const u64 b = g_layout->jitter_b;
+    if (std::memcmp(at(a), GuardA1, 4) != 0 || std::memcmp(at(a + 0x8), GuardA2, 4) != 0 ||
+        std::memcmp(at(b), GuardB, 4) != 0 || std::memcmp(at(b + 0xa), GuardB, 4) != 0) {
         return false;
     }
-    for (const auto& e : JitterEdits) {
+    for (const auto& e : JitterEdits()) {
         u32 live = 0;
         std::memcpy(&live, at(e.offset), e.size);
         if (live != e.original) {
@@ -995,14 +1110,15 @@ void SetJitterPatch(bool on) {
     if (on == g_jitter_patched) {
         return;
     }
-    if (on && (!g_eboot_107 || g_eboot_scratch == 0 || !JitterBytesOriginal())) {
+    if (on && (!g_layout || g_eboot_scratch == 0 || !JitterBytesOriginal())) {
         if (!g_jitter_refused) {
             g_jitter_refused = true;
-            LOG_ERROR(Loader, "DLSS jitter: refused (eboot 01.07 bytes differ or no slot)");
+            LOG_ERROR(Loader, "DLSS jitter: refused (eboot {} bytes differ or no slot)",
+                      g_layout ? g_layout->name : "of no known layout");
         }
         return;
     }
-    for (const auto& e : JitterEdits) {
+    for (const auto& e : JitterEdits()) {
         u32 value = e.original;
         if (on) {
             value = e.size == 2 ? 0x9066 // 66 90: a 2-byte nop
@@ -1041,7 +1157,7 @@ void HaltonProbe(RenderSize now) {
         const char* v = std::getenv("SHADPS4_HALTON_PROBE");
         return v && v[0] == '1';
     }();
-    if (!on || !g_eboot_107 || now.width == 0 || now.height == 0) {
+    if (!on || !g_layout || now.width == 0 || now.height == 0) {
         return;
     }
     static const s64 start = NowMs();
@@ -1092,7 +1208,7 @@ void HaltonProbe(RenderSize now) {
                      off, base + off, a, b, p00);
         }
     };
-    const VAddr cam = *reinterpret_cast<const u64*>(g_eboot_address + 0x7f2d2b8);
+    const VAddr cam = *reinterpret_cast<const u64*>(g_eboot_address + g_layout->camera_ptr);
     if (cam != 0) {
         scan(cam, 0x2000, "camera");
     }
@@ -1126,10 +1242,10 @@ void RebaseHistoryJitter(RenderSize now, float jx, float jy) {
         const char* v = std::getenv("SHADPS4_HALTON_REBASE");
         return !(v && v[0] == '0');
     }();
-    if (!on || !g_eboot_107 || now.width == 0 || now.height == 0) {
+    if (!on || !g_layout || now.width == 0 || now.height == 0) {
         return;
     }
-    const VAddr cam = *reinterpret_cast<const u64*>(g_eboot_address + 0x7f2d2b8);
+    const VAddr cam = *reinterpret_cast<const u64*>(g_eboot_address + g_layout->camera_ptr);
     // A stale or not-yet-set camera pointer (loads, menus) must not fault Game:Main.
     auto* const memory = Core::Memory::Instance();
     if (cam == 0 || !memory || !memory->IsMappedRange(cam + 0x380, 0x80)) {
@@ -1157,6 +1273,11 @@ void RebaseHistoryJitter(RenderSize now, float jx, float jy) {
             LOG_WARNING(Loader, "Halton rebase: the camera history layout differs, left alone");
         }
         return;
+    }
+    static bool applied_logged = false;
+    if (!applied_logged) {
+        applied_logged = true;
+        LOG_INFO(Loader, "Halton rebase: camera history at {:#x} ({})", cam, g_layout->name);
     }
     // The game's window offset is (X / W, Y / H) with X = -2 jx, Y = 2 jy: A = 2 jx / W, B = -2 jy / H.
     const double da = 2.0 * jx / now.width - a;
@@ -1255,7 +1376,10 @@ void OnSubmitDone() {
         // The last poke: taken when the game's size table holds S (slot 0 = the output size at
         // renderer +0xdf0f14 = 0x801d0cbe4, study sec. 1; its change block wrote it).
         u32 table[2];
-        std::memcpy(table, reinterpret_cast<const void*>(g_eboot_address + 0x1d0cbe4), 8);
+        std::memcpy(table,
+                    reinterpret_cast<const void*>(g_eboot_address + g_layout->renderer +
+                                                  RendererSizeTable),
+                    8);
         if (table[0] == u32(g_live_check >> 32) && table[1] == u32(g_live_check)) {
             const u64 old_size = g_now_size.exchange(g_live_check, std::memory_order_acq_rel);
             g_live_ms.store(NowMs(), std::memory_order_relaxed);
@@ -1332,8 +1456,8 @@ static void ApplyHudWidth() {
     // The margin code exists three times (the size setup and two refreshes): per copy the floor
     // load vmovss disp(%rip), %xmm2 -> vxorps xmm2, xmm2, xmm2 + 4-byte nop (followed by
     // vminss / vcmpltss), and vmulss %xmm0, %xmm2, %xmm0 (H * r) -> vmovaps %xmm2, %xmm0 (H).
-    static constexpr u64 floors[3] = {0x1f042f, 0x1f2aae, 0x1f2bae};
-    static constexpr u64 ymuls[3] = {0x1f0471, 0x1f2afb, 0x1f2bfb};
+    const auto& floors = g_layout->hud_floor; // 01.07: 0x1f042f, 0x1f2aae, 0x1f2bae
+    const auto& ymuls = g_layout->hud_ymul;   // 01.07: 0x1f0471, 0x1f2afb, 0x1f2bfb
     static constexpr u8 floor_head[4] = {0xc5, 0xfa, 0x10, 0x15};
     static constexpr u8 floor_tail[9] = {0xc5, 0xf2, 0x5d, 0xc8, 0xc5, 0xfa, 0xc2, 0xc2, 0x01};
     static constexpr u8 floor_new[8] = {0xc5, 0xe8, 0x57, 0xd2, 0x0f, 0x1f, 0x40, 0x00};
@@ -1344,8 +1468,8 @@ static void ApplyHudWidth() {
         if (std::memcmp(at(floors[i]), floor_head, 4) != 0 ||
             std::memcmp(at(floors[i] + 8), floor_tail, 9) != 0 ||
             std::memcmp(at(ymuls[i]), ymul_old, 4) != 0) {
-            LOG_ERROR(Loader, "SHADPS4_HUD: refused, the safe-area code differs at copy {} "
-                              "(eboot 01.07 only)", i);
+            LOG_ERROR(Loader, "SHADPS4_HUD: refused, the safe-area code differs at copy {} ({})",
+                      i, g_layout->name);
             return;
         }
     }
@@ -1430,11 +1554,14 @@ static void ApplyPerfMode() {
 }
 
 int GameQualityLevel() {
-    if (g_eboot_address == 0 || !g_eboot_107) {
+    if (g_eboot_address == 0 || !g_layout) {
         return -1;
     }
     s32 level;
-    std::memcpy(&level, reinterpret_cast<const void*>(g_eboot_address + 0xf39978), 4);
+    std::memcpy(&level,
+                reinterpret_cast<const void*>(g_eboot_address + g_layout->renderer +
+                                              RendererQualityLevel),
+                4);
     return level;
 }
 
@@ -1496,19 +1623,25 @@ static void ApplyHouseSplit() {
 }
 
 void OnGameLoaded() {
-    g_eboot_107 = DetectEboot107();
-    if (g_eboot_107) {
-        ApplyParticleLateRead();
-        ApplyParticleLightOneSubmit();
-        ApplyHouseSplit();
+    g_layout = DetectLayout();
+    if (g_layout) {
+        LOG_INFO(Loader, "Built-in game patches: {} layout", g_layout->name);
+        if (SecondSon107Loaded()) {
+            ApplyParticleLateRead();
+            ApplyParticleLightOneSubmit();
+            ApplyHouseSplit();
+        }
         ApplyAspectRatio();
         ApplyHudWidth();
-        ApplyPerfMode();
+        if (SecondSon107Loaded()) {
+            ApplyPerfMode();
+        }
     } else {
         LOG_WARNING(Loader,
-                    "This game's code is not update 01.07 (code hash {:#018x}, {} segments): the "
-                    "built-in game patches are off (screen shape and HUD width, render size, "
-                    "particle and performance patches, DLSS jitter). Install update 01.07 for them.",
+                    "This game's code is not Second Son update 01.07 or First Light 01.04 (code "
+                    "hash {:#018x}, {} segments): the built-in game patches are off (screen shape "
+                    "and HUD width, render size, particle and performance patches, DLSS jitter). "
+                    "Install update 01.07 for them.",
                     Common::ElfInfo::Instance().EbootCodeHash(), g_eboot_segments.size());
     }
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);

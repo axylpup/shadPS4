@@ -26,8 +26,9 @@ extern const bool g_native_census;
 /// SHADPS4_NATIVE_PASS: 0 off, 1 native shadow batches, 2 verify (generic path renders).
 extern const int g_native_pass;
 /// SHADPS4_NATIVE_COLOUR=1 (with SHADPS4_NATIVE_PASS): textured pipelines get native variants
-/// too (notes/colour-pass-2026-10-09.md sec. 3).
-extern const bool g_native_colour;
+/// too (notes/colour-pass-2026-10-09.md sec. 3). Not const: emulator.cpp turns it off for First
+/// Light before the renderer starts.
+extern bool g_native_colour;
 /// SHADPS4_NATIVE_COLOUR_DIAG (bisect, default 0): 1 = colour batches take no joins, 2 = packed
 /// 10:10:10:2 vertex formats not pulled, 4 = buffers with 8 / 16-bit loads ineligible, 8 =
 /// formatted buffers ineligible, 16 = PS stays non-native (no colour variants at all).
@@ -61,3 +62,4 @@ struct NativeJoinVi {
 inline thread_local NativeCensusVi t_native_vi{};
 
 } // namespace VideoCore
+ 

@@ -60,7 +60,7 @@ const u32 g_native_colour_diag = [] {
     const char* e = std::getenv("SHADPS4_NATIVE_COLOUR_DIAG");
     return e ? static_cast<u32>(std::strtoul(e, nullptr, 0)) : 0u;
 }();
-const bool g_native_colour = [] {
+bool g_native_colour = [] {
     const char* e = std::getenv("SHADPS4_NATIVE_COLOUR");
     return g_native_pass != 0 && e && e[0] == '1';
 }();
