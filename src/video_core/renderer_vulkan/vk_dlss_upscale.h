@@ -13,6 +13,7 @@
 
 namespace Vulkan {
 class Instance;
+class Scheduler;
 }
 
 // SHADPS4_DLSS_UPSCALE=1 (with SHADPS4_DLSS=1; plan notes/study-dlss-plan-2026-10-14.md sec. 4,
@@ -36,6 +37,17 @@ bool UpscaleWanted();
 /// SHADPS4_DLSS_UPSCALE_TEST bits (crash bisect, 2026-10-17): 1 = no composite at the flip (the
 /// display buffer is shown), 2 = no alpha on HUD draws, 4 = no clear of the resolve target.
 u32 UpscaleTestBits();
+
+/// SHADPS4_HUD_NATIVE (off by default): with the HUD-layer mode on, the game's HUD draws after
+/// the resolve (the passes whose colour target is the HUD layer) render into the upscaler's own
+/// image at an integer multiple of the render size instead of the game's layer - sharp text and
+/// menus at render sizes below the window (e.g. 67% of 1440p). The game's images are untouched
+/// (its layer stays cleared). =1: the smallest integer scale that reaches the DLSS output size;
+/// =2..4: that scale. The composite supersamples the larger layer down to the output.
+u32 HudNativeSetting();
+
+/// The native HUD scale for a HUD layer of `game` size under an output of `output` size (1 = none).
+u32 HudNativeScale(vk::Extent2D game, vk::Extent2D output);
 
 /// The HUD-layer mode is on for this frame's draws (the presenter decides it each flip).
 inline std::atomic<bool> g_hud_layer{false};
@@ -95,6 +107,39 @@ public:
     /// Flip: the job for this frame (and ready cleared). hud_view = the HUD layer.
     CompositeJob TakeJob(vk::ImageView hud_view);
 
+    /// SHADPS4_HUD_NATIVE, resolve (GPU thread): (re)creates the native HUD image at game x
+    /// scale, clears it to 0 and leaves it as a colour attachment; the redirect is on until the
+    /// flip.
+    void BeginNativeHud(Scheduler& scheduler, vk::Extent2D game, vk::Format format, u32 scale);
+    struct NativeHud {
+        vk::Image image;
+        vk::ImageView view;
+        vk::Format format;
+        vk::Extent2D game; ///< the HUD layer's guest size
+        u32 scale;
+    };
+    /// Draw paths (GPU thread): the redirect target while it is on, else nullptr.
+    const NativeHud* NativeHudTarget() const {
+        return hud_on ? &hud_info : nullptr;
+    }
+    /// Flip (GPU thread): ends the redirect; with it on, records the write -> read barrier and
+    /// returns the native image's view for the composite (else a null view).
+    vk::ImageView EndNativeHud(Scheduler& scheduler);
+    /// Draw paths (GPU thread): the HUD passes' depth at the native scale (most HUD passes bind
+    /// the scene depth). The first call of a frame records a nearest-filter blit of `src` (the
+    /// game's depth, already in TRANSFER_SRC) into it; layout GENERAL afterwards. Returns a null
+    /// view when the format cannot be blitted.
+    vk::ImageView NativeHudDepth(Scheduler& scheduler, vk::Image src, vk::Format format,
+                                 vk::ImageAspectFlags aspect);
+    /// This frame's depth copy was recorded (the caller then skips the source transition).
+    bool NativeHudDepthCopied() const {
+        return hud_depth_ready;
+    }
+    /// Draw paths (GPU thread): a pass was sent to the native HUD image (statistics).
+    void NoteNativeHudPass() const {
+        ++hud_passes;
+    }
+
 private:
     struct Target {
         VideoCore::UniqueImage image;
@@ -110,6 +155,15 @@ private:
     vk::UniquePipeline pipeline;
     std::unique_ptr<Target> scene; ///< DLSS output, RGBA8 UNORM (storage)
     std::unique_ptr<Target> out;   ///< composite, RGBA16F linear
+    std::unique_ptr<Target> hud;   ///< SHADPS4_HUD_NATIVE: the HUD at game x scale
+    NativeHud hud_info{};
+    bool hud_on{};
+    mutable u64 hud_passes{};  ///< passes redirected this frame
+    std::unique_ptr<Target> hud_depth; ///< SHADPS4_HUD_NATIVE: scene depth at game x scale
+    vk::Format hud_depth_format{};
+    vk::Extent2D hud_depth_size{};
+    bool hud_depth_ready{}; ///< copied this frame
+    u64 hud_frames{}, hud_frames_empty{}, hud_passes_total{};
     vk::ImageLayout scene_layout{vk::ImageLayout::eUndefined};
     vk::Extent2D output_size{};
     vk::Extent2D image_size{};

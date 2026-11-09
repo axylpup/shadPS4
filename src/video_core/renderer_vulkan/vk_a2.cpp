@@ -1066,6 +1066,13 @@ bool StretchTranslator::Impl::Take(const AmdGpu::Regs& regs, const DrawIn& draw)
         VideoCore::WaterScale::g_counters.worker_refusals.fetch_add(1, std::memory_order_relaxed);
         return refuse(RefuseOff);
     }
+    // SHADPS4_HUD_NATIVE (vk_dlss_upscale.h): draws into the HUD layer go to the back, whose
+    // BeginRendering sends the HUD passes to the native HUD image. Decided by the HUD-layer mode
+    // (stable across frames), not by the redirect itself: this runs ahead of the back's resolve.
+    if (Dlss::HudNativeSetting() != 0 && Dlss::HudLayerActive() && regs.color_buffers[0] &&
+        regs.color_buffers[0].Address() == Dlss::HudLayerAddr()) [[unlikely]] {
+        return refuse(RefuseOff);
+    }
     if (!draw.is_indexed) {
         return refuse(RefuseNotIndexed);
     }
