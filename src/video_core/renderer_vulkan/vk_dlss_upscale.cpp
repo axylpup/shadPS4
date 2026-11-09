@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -10,6 +11,7 @@
 #include "video_core/renderer_vulkan/vk_dlss_upscale.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan::Dlss {
@@ -39,6 +41,36 @@ u32 UpscaleTestBits() {
         return v ? static_cast<u32>(std::atoi(v)) : 0u;
     }();
     return bits;
+}
+
+u32 HudNativeSetting() {
+    static const u32 setting = [] {
+        const char* v = std::getenv("SHADPS4_HUD_NATIVE");
+        const int n = v ? std::atoi(v) : 0;
+        const u32 s = n <= 0 ? 0u : static_cast<u32>(std::min(n, 4));
+        if (s != 0) {
+            LOG_INFO(Render_Vulkan, "SHADPS4_HUD_NATIVE={}: the HUD layer is drawn at {}", v,
+                     s == 1 ? "the output size (integer scale)" : "a fixed scale");
+        }
+        return s;
+    }();
+    return setting;
+}
+
+u32 HudNativeScale(vk::Extent2D game, vk::Extent2D output) {
+    const u32 setting = HudNativeSetting();
+    if (setting == 0 || game.width == 0 || game.height == 0) {
+        return 1;
+    }
+    if (setting >= 2) {
+        return setting;
+    }
+    // The smallest integer scale whose layer is at least the output (2% slack: 2560x1440 over
+    // 1712x968 is 1.495 / 1.488 = 2; 1920x1080 over 1920x1080 stays 1).
+    const double r =
+        std::max(double(output.width) / game.width, double(output.height) / game.height);
+    const u32 s = static_cast<u32>(std::ceil(r - 0.02));
+    return std::clamp<u32>(s, 1, 4);
 }
 
 Upscaler::Upscaler(const Instance& instance_) : instance{instance_}, device{instance_.GetDevice()} {
@@ -253,6 +285,216 @@ CompositeJob Upscaler::TakeJob(vk::ImageView hud_view) {
         .out_view = out->view.get(),
         .size = image_size,
     };
+}
+
+void Upscaler::BeginNativeHud(Scheduler& scheduler, vk::Extent2D game, vk::Format format,
+                              u32 scale) {
+    const vk::Extent2D size{game.width * scale, game.height * scale};
+    if (!hud || hud_info.format != format || hud_info.game != game || hud_info.scale != scale) {
+        if (hud) {
+            retired.emplace_back(flips, std::move(hud));
+        }
+        hud = std::make_unique<Target>();
+        hud->image = VideoCore::UniqueImage(device, instance.GetAllocator());
+        hud->image.Create(vk::ImageCreateInfo{
+            .imageType = vk::ImageType::e2D,
+            .format = format,
+            .extent{size.width, size.height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+                     vk::ImageUsageFlagBits::eTransferDst,
+            .initialLayout = vk::ImageLayout::eUndefined,
+        });
+        SetObjectName(device, static_cast<vk::Image>(hud->image), "Native HUD {}x{}", size.width,
+                      size.height);
+        hud->view = Check<"create native hud view">(device.createImageViewUnique({
+            .image = hud->image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = format,
+            .subresourceRange = ColorRange,
+        }));
+        hud_info = NativeHud{
+            .image = hud->image,
+            .view = hud->view.get(),
+            .format = format,
+            .game = game,
+            .scale = scale,
+        };
+        LOG_INFO(Render_Vulkan, "SHADPS4_HUD_NATIVE: HUD drawn at {}x{} ({}x the {}x{} layer)",
+                 size.width, size.height, scale, game.width, game.height);
+    }
+    // Recorded in stream order with the draws (the async recorder runs them later).
+    scheduler.EndRendering();
+    scheduler.Record([image = hud_info.image](vk::CommandBuffer cmdbuf) {
+    // Last frame's composite read it (an earlier submission); the contents are discarded.
+    const vk::ImageMemoryBarrier2 to_clear{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eNone,
+        .dstStageMask = vk::PipelineStageFlagBits2::eClear,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+        .image = image,
+        .subresourceRange = ColorRange,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &to_clear,
+    });
+    cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal,
+                           vk::ClearColorValue{std::array{0.0f, 0.0f, 0.0f, 0.0f}}, ColorRange);
+    const vk::ImageMemoryBarrier2 to_draw{
+        .srcStageMask = vk::PipelineStageFlagBits2::eClear,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+                         vk::AccessFlagBits2::eColorAttachmentWrite,
+        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .image = image,
+        .subresourceRange = ColorRange,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &to_draw,
+    });
+    });
+    hud_on = true;
+    hud_passes = 0;
+    hud_depth_ready = false;
+}
+
+vk::ImageView Upscaler::NativeHudDepth(Scheduler& scheduler, vk::Image src, vk::Format format,
+                                       vk::ImageAspectFlags aspect) {
+    const vk::Extent2D size{hud_info.game.width * hud_info.scale,
+                            hud_info.game.height * hud_info.scale};
+    if (!hud_depth || hud_depth_format != format || hud_depth_size != size) {
+        const auto props = instance.GetPhysicalDevice().getFormatProperties(format);
+        const auto need = vk::FormatFeatureFlagBits::eBlitSrc |
+                          vk::FormatFeatureFlagBits::eBlitDst |
+                          vk::FormatFeatureFlagBits::eDepthStencilAttachment;
+        if ((props.optimalTilingFeatures & need) != need) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LOG_WARNING(Render_Vulkan, "SHADPS4_HUD_NATIVE: depth format {} cannot be blitted; "
+                                           "HUD passes with depth stay at the render size",
+                            vk::to_string(format));
+            }
+            return {};
+        }
+        if (hud_depth) {
+            retired.emplace_back(flips, std::move(hud_depth));
+        }
+        hud_depth = std::make_unique<Target>();
+        hud_depth->image = VideoCore::UniqueImage(device, instance.GetAllocator());
+        hud_depth->image.Create(vk::ImageCreateInfo{
+            .imageType = vk::ImageType::e2D,
+            .format = format,
+            .extent{size.width, size.height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment |
+                     vk::ImageUsageFlagBits::eTransferDst,
+            .initialLayout = vk::ImageLayout::eUndefined,
+        });
+        SetObjectName(device, static_cast<vk::Image>(hud_depth->image), "Native HUD depth {}x{}",
+                      size.width, size.height);
+        hud_depth->view = Check<"create native hud depth view">(device.createImageViewUnique({
+            .image = hud_depth->image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = format,
+            .subresourceRange{.aspectMask = aspect, .levelCount = 1, .layerCount = 1},
+        }));
+        hud_depth_format = format;
+        hud_depth_size = size;
+        hud_depth_ready = false;
+        LOG_INFO(Render_Vulkan, "SHADPS4_HUD_NATIVE: HUD depth {}x{} {}", size.width, size.height,
+                 vk::to_string(format));
+    }
+    if (!hud_depth_ready) {
+        hud_depth_ready = true;
+        scheduler.EndRendering();
+        scheduler.Record([src, dst = static_cast<vk::Image>(hud_depth->image), aspect,
+                          game = hud_info.game, size](vk::CommandBuffer cmdbuf) {
+            const vk::ImageSubresourceRange range{
+                .aspectMask = aspect, .levelCount = 1, .layerCount = 1};
+            const vk::ImageMemoryBarrier2 to_copy{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eNone,
+                .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                .image = dst,
+                .subresourceRange = range,
+            };
+            cmdbuf.pipelineBarrier2(
+                vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_copy});
+            const vk::ImageSubresourceLayers layers{.aspectMask = aspect, .layerCount = 1};
+            const vk::ImageBlit blit{
+                .srcSubresource = layers,
+                .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                         vk::Offset3D{s32(game.width), s32(game.height), 1}},
+                .dstSubresource = layers,
+                .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                         vk::Offset3D{s32(size.width), s32(size.height), 1}},
+            };
+            cmdbuf.blitImage(src, vk::ImageLayout::eTransferSrcOptimal, dst,
+                             vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+            const vk::ImageMemoryBarrier2 to_draw{
+                .srcStageMask = vk::PipelineStageFlagBits2::eBlit,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                vk::PipelineStageFlagBits2::eLateFragmentTests,
+                .dstAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                 vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .image = dst,
+                .subresourceRange = range,
+            };
+            cmdbuf.pipelineBarrier2(
+                vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_draw});
+        });
+    }
+    return hud_depth->view.get();
+}
+
+vk::ImageView Upscaler::EndNativeHud(Scheduler& scheduler) {
+    if (!hud_on) {
+        return {};
+    }
+    hud_on = false;
+    ++hud_frames;
+    hud_passes_total += hud_passes;
+    hud_frames_empty += hud_passes == 0;
+    if (hud_frames % 600 == 1) {
+        LOG_INFO(Render_Vulkan, "SHADPS4_HUD_NATIVE: {} frames, {:.1f} HUD passes per frame, {} "
+                                "frames without one",
+                 hud_frames, double(hud_passes_total) / double(hud_frames), hud_frames_empty);
+    }
+    scheduler.EndRendering();
+    scheduler.Record([image = hud_info.image](vk::CommandBuffer cmdbuf) {
+    const vk::ImageMemoryBarrier2 to_read{
+        .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .image = image,
+        .subresourceRange = ColorRange,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &to_read,
+    });
+    });
+    return hud_info.view;
 }
 
 void RecordComposite(vk::CommandBuffer cmdbuf, const CompositeJob& job) {

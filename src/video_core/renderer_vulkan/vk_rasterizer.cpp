@@ -1653,6 +1653,15 @@ void Rasterizer::ExecuteFilteredDraw(DrawClass draw_class) {
     }
 }
 
+// SHADPS4_HUD_NATIVE (vk_dlss_upscale.h): the redirect target between the resolve and the flip.
+static const Dlss::Upscaler::NativeHud* NativeHudTarget(const Instance& instance) {
+    if (Dlss::HudNativeSetting() == 0) [[likely]] {
+        return nullptr;
+    }
+    const Dlss::Upscaler* upscaler = Dlss::GetUpscaler(instance);
+    return upscaler ? upscaler->NativeHudTarget() : nullptr;
+}
+
 void Rasterizer::DlssResolve() {
     // SHADPS4_DLSS (vk_dlss.h): the game's T2x resolve replaced. =1: DLAA from the tonemap output
     // 0x2f9e10000 + motion vectors + depth into the resolve's target; =2 or any failure this frame:
@@ -1798,6 +1807,13 @@ void Rasterizer::DlssResolve() {
             if (upscaler && evaluated) {
                 upscaler->SceneWritten(cmdbuf);
                 hud_layer = true;
+                // SHADPS4_HUD_NATIVE (vk_dlss_upscale.h): the HUD draws after this resolve go
+                // to the upscaler's own image at an integer multiple of the render size.
+                const vk::Extent2D game{out.info.size.width, out.info.size.height};
+                const u32 hud_scale = Dlss::HudNativeScale(game, upscaler->OutputSize());
+                if (hud_scale > 1 && out.info.num_samples <= 1) {
+                    upscaler->BeginNativeHud(scheduler, game, out.info.pixel_format, hud_scale);
+                }
             }
             // Streamline / NGX bind their own compute state into this command buffer (checklist
             // sec. 4): nothing the next draw relies on may be assumed still bound.
@@ -8207,7 +8223,9 @@ void Rasterizer::DrawTail(const GraphicsPipeline* pipeline, bool is_indexed, u32
         }
     }
     RenderState state;
-    if (rs_hit && RenderStateMemoBeginOk()) {
+    // SHADPS4_HUD_NATIVE: while the HUD redirect is on, passes take the full path (it decides
+    // the redirect; a remembered state would draw HUD passes into the game's layer).
+    if (rs_hit && !NativeHudTarget(instance) && RenderStateMemoBeginOk()) {
         RenderStateMemoBegin(state);
         ++rs_stats.begin_hits;
     } else {
@@ -13330,6 +13348,9 @@ void Rasterizer::RenderStateMemoStore(const GraphicsPipeline* pipeline, const Re
     auto& m = rs_memo;
     auto& st = rs_stats;
     m.valid = false;
+    if (hud_redirected) {
+        return; // SHADPS4_HUD_NATIVE: a redirected state is this frame's only
+    }
     if (attachment_feedback_loop) {
         ++st.refused_feedback;
         return;
@@ -13744,6 +13765,101 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             const u64 n = c.scaled_passes.fetch_add(1, std::memory_order_relaxed) + 1;
             if ((n & 0x3fff) == 0 && db_desc.first) {
                 WaterScaleLog("periodic", texture_cache.GetImage(db_desc.first));
+            }
+        }
+    }
+    // SHADPS4_HUD_NATIVE (vk_dlss_upscale.h): between the resolve and the flip, a pass whose
+    // only colour target is the HUD layer renders into the upscaler's own image at scale x the
+    // layer (viewports / scissors scaled at commit, as for a scaled backing); a depth target of
+    // the layer's size is swapped for a scaled copy. Passes with more targets, another depth
+    // size or a feedback loop keep the game's layer (logged).
+    hud_redirected = false;
+    if (const Dlss::Upscaler::NativeHud* hud = NativeHudTarget(instance)) [[unlikely]] {
+        const auto& col0 = regs.color_buffers[0];
+        const auto cb0_id = cb_descs[0].first;
+        const bool into_layer = col0 && col0.Address() == Dlss::HudLayerAddr();
+        // A depth target is redirected too (a scaled copy, Upscaler::NativeHudDepth) when it has
+        // the layer's size.
+        const VideoCore::Image* depth =
+            db_desc.first ? &texture_cache.GetImage(db_desc.first) : nullptr;
+        const bool depth_ok = !depth || (depth->info.size.width == hud->game.width &&
+                                         depth->info.size.height == hud->game.height &&
+                                         depth->info.num_samples <= 1 &&
+                                         depth->BackingScale() == 1);
+        if (into_layer && (state.num_color_attachments != 1 || !cb0_id || !depth_ok ||
+                           attachment_feedback_loop || state.scale > 1)) {
+            static u32 logged = 0;
+            if (++logged <= 8) {
+                LOG_WARNING(Render_Vulkan,
+                            "SHADPS4_HUD_NATIVE: a pass into the HUD layer stays in the game's "
+                            "layer (colour targets {}, depth {}, feedback loop {}, scale {})",
+                            state.num_color_attachments, db_desc.first ? "yes" : "no",
+                            attachment_feedback_loop, state.scale);
+            }
+        } else if (into_layer) {
+            const auto& guest = texture_cache.GetImage(cb0_id).info;
+            if (guest.size.width != hud->game.width || guest.size.height != hud->game.height ||
+                guest.pixel_format != hud->format) {
+                static u32 logged = 0;
+                if (++logged <= 8) {
+                    LOG_WARNING(Render_Vulkan,
+                                "SHADPS4_HUD_NATIVE: a pass into the HUD layer stays in the game's "
+                                "layer ({}x{} {}, expected {}x{} {})", guest.size.width,
+                                guest.size.height, vk::to_string(guest.pixel_format),
+                                hud->game.width, hud->game.height, vk::to_string(hud->format));
+                }
+            } else {
+                vk::ImageView depth_view{};
+                if (depth) {
+                    auto& dimg = texture_cache.GetImage(db_desc.first);
+                    Dlss::Upscaler* up = Dlss::GetUpscaler(instance);
+                    if (!up->NativeHudDepthCopied()) {
+                        scheduler.EndRendering();
+                        dimg.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                                     vk::AccessFlagBits2::eTransferRead, {});
+                    }
+                    depth_view = up->NativeHudDepth(
+                        scheduler, dimg.GetImage(), dimg.info.pixel_format, dimg.aspect_mask);
+                }
+                if (depth && !depth_view) {
+                    // The depth format cannot be blitted (logged once): the game's layer.
+                } else {
+                    if (depth) {
+                        auto& da = state.depth_stencil_attachment;
+                        da.image_view = depth_view;
+                        da.image_layout = vk::ImageLayout::eGeneral;
+                    }
+                    auto& ca = state.color_attachments[0];
+                    ca.image_view = hud->view;
+                    ca.image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+                    state.width = static_cast<u16>(hud->game.width * hud->scale);
+                    state.height = static_cast<u16>(hud->game.height * hud->scale);
+                    state.num_layers = 1;
+                    state.scale = static_cast<u16>(hud->scale);
+                    hud_redirected = true;
+                    if (!scheduler.RenderingMatches(state)) {
+                        Dlss::GetUpscaler(instance)->NoteNativeHudPass();
+                        // The previous HUD pass's writes before this one's blending reads.
+                        scheduler.EndRendering();
+                        const vk::MemoryBarrier2 barrier{
+                            .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                                            vk::PipelineStageFlagBits2::eLateFragmentTests,
+                            .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite |
+                                             vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+                            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                                            vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                            vk::PipelineStageFlagBits2::eLateFragmentTests,
+                            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+                                             vk::AccessFlagBits2::eColorAttachmentWrite |
+                                             vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                             vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+                        };
+                        scheduler.Record([barrier](vk::CommandBuffer cmdbuf) {
+                            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                                .memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+                        });
+                    }
+                }
             }
         }
     }

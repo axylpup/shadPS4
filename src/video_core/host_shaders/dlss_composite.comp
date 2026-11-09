@@ -28,7 +28,20 @@ void main() {
         return;
     }
     const vec2 uv = (vec2(pos) + 0.5) / vec2(size);
-    const vec4 hud = texture(sampler2D(hud_layer, linear_sampler), uv);
+    // SHADPS4_HUD_NATIVE: a layer larger than the output (the native HUD image, an integer
+    // multiple of the render size) is averaged from four bilinear taps a quarter output pixel
+    // apart, so its finer text is filtered, not skipped.
+    const vec2 hud_size = vec2(textureSize(sampler2D(hud_layer, linear_sampler), 0));
+    vec4 hud;
+    if (hud_size.x > float(size.x) * 1.01 || hud_size.y > float(size.y) * 1.01) {
+        const vec2 d = 0.25 / vec2(size);
+        hud = 0.25 * (texture(sampler2D(hud_layer, linear_sampler), uv + vec2(-d.x, -d.y)) +
+                      texture(sampler2D(hud_layer, linear_sampler), uv + vec2(d.x, -d.y)) +
+                      texture(sampler2D(hud_layer, linear_sampler), uv + vec2(-d.x, d.y)) +
+                      texture(sampler2D(hud_layer, linear_sampler), uv + d));
+    } else {
+        hud = texture(sampler2D(hud_layer, linear_sampler), uv);
+    }
     const vec3 base = texelFetch(sampler2D(scene, linear_sampler), pos, 0).rgb;
     const vec3 encoded = clamp(hud.rgb + (1.0 - hud.a) * base, 0.0, 1.0);
     // The game's frame is red / blue swapped in its own images; its final copy (fs_529286b5)

@@ -1049,6 +1049,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 dlss_job = upscaler->TakeJob(*hud.FindView(hud_view_info).image_view);
             }
         }
+        // SHADPS4_HUD_NATIVE (vk_dlss_upscale.h): this frame's HUD went to the upscaler's own
+        // image; the redirect ends at every flip (the layer's memory is an ordinary target
+        // earlier in the next frame).
+        if (upscaler->NativeHudTarget()) {
+            const vk::ImageView native_hud = upscaler->EndNativeHud(draw_scheduler);
+            if (dlss_job) {
+                dlss_job->hud_view = native_hud;
+            }
+        }
         upscaler->SetOutputSize(frame->width, frame->height, game_pq && !pq_composite);
     }
 

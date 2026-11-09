@@ -1162,6 +1162,7 @@ private:
         decoded_image_descs{};
     bool& fault_process_pending; ///< In Shared.
     bool attachment_feedback_loop{};
+    bool hud_redirected{}; ///< SHADPS4_HUD_NATIVE: this pass draws into the native HUD image
 
     // SHADPS4_RENDER_STATE_MEMO=1 (=2 verify), default off, direct draws (DrawTail) only:
     // PrepareRenderState + BeginRendering recompute the same render targets and RenderState for
