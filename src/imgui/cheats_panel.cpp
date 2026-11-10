@@ -31,6 +31,7 @@ private:
     void DrawFile(size_t index, const Cheats::File& file);
 
     std::vector<Cheats::File> files;
+    std::string message; ///< why the last click was not done
 };
 
 Panel g_panel; // one object for the whole run: adds and removes are queued in order
@@ -57,12 +58,12 @@ void Panel::DrawFile(size_t index, const Cheats::File& file) {
         ImGui::BeginDisabled(!ready);
         if (mod.is_button) {
             if (ImGui::Button(mod.name.c_str())) {
-                Cheats::Set(index, m, true);
+                message = Cheats::Set(index, m, true);
             }
         } else {
             bool on = mod.on;
             if (ImGui::Checkbox(mod.name.c_str(), &on)) {
-                Cheats::Set(index, m, on);
+                message = Cheats::Set(index, m, on);
                 stale = true;
             }
         }
@@ -72,7 +73,7 @@ void Panel::DrawFile(size_t index, const Cheats::File& file) {
             ImGui::TextColored(Yellow, "%s",
                                mod.state == Cheats::ModState::Mismatch
                                    ? "- does not match this game's code"
-                                   : "- needs memory outside the game (console only)");
+                                   : "- needs memory outside the game");
         }
         ImGui::PopID();
     }
@@ -124,8 +125,14 @@ void Panel::Draw() {
             ImGui::PopID();
         }
         ImGui::Separator();
+        if (!message.empty()) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(Yellow, "%s", message.c_str());
+            ImGui::PopTextWrapPos();
+        }
         if (ImGui::Button("Reload")) {
             Cheats::Reload();
+            message.clear();
             stale = true;
         }
         ImGui::SameLine();

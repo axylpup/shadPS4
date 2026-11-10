@@ -19,18 +19,24 @@
 // version or region therefore shows its cheats as "does not match" instead of corrupting the
 // game, and a file for another region with the same code simply works. Offsets are tried as
 // relative to the eboot and as absolute PS4 addresses (minus 0x400000): both are in use.
+//
+// Code caves: cheats made on a console often put their code at an address far outside the game
+// (free memory of a system module there) and jump to it. Such an entry is moved into the
+// executable area the emulator keeps right behind the game's image, and the jumps into it and
+// out of it are rewritten for the new place.
 namespace Cheats {
 
 enum class ModState : u8 {
     Ready,    ///< every entry found: can be switched
     Mismatch, ///< the game's bytes are not the file's (another version)
-    Outside,  ///< an entry or its jump target is outside the game's loaded code / data
+    Outside,  ///< an entry or its jump target is outside the game and could not be moved
 };
 
 struct Entry {
     u64 offset = 0; ///< resolved, relative to the eboot
     std::vector<u8> on;
     std::vector<u8> off;
+    bool cave = false; ///< moved into the emulator's cave area (written first, removed last)
 };
 
 struct Mod {
@@ -38,6 +44,7 @@ struct Mod {
     bool is_button = false; ///< "button": written once; "checkbox": on / off
     ModState state = ModState::Mismatch;
     bool on = false;
+    bool moved = false; ///< has code caves that were moved
     std::vector<Entry> entries;
 };
 
@@ -60,10 +67,11 @@ void OnGameLoaded();
 /// Reads the folder again (the panel's Reload button). Cheats that are on stay on.
 void Reload();
 
-/// A copy for the panel.
+/// A copy for the panel, with every checkbox's state read from the game's memory.
 std::vector<File> Files();
 
-/// Switches a checkbox, or presses a button (`on` = true). False when it cannot be applied.
-bool Set(size_t file, size_t mod, bool on);
+/// Switches a checkbox, or presses a button (`on` = true). Returns an empty string, or why it
+/// was not done (for the panel).
+std::string Set(size_t file, size_t mod, bool on);
 
 } // namespace Cheats
