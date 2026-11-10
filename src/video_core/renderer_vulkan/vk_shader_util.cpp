@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <memory>
@@ -273,7 +274,100 @@ bool SsrDitherEnabled() {
     return SsrDitherMode() != 0;
 }
 
+namespace {
+
+/// SHADPS4_PROBE_WALK_NAN_EXIT=1 (default off; GitHub #27, fights and the chain): the game hides
+/// dead debris and particle instances by writing NaN into their translation. Their vertex shaders
+/// (vs_3ab1ca58: debris into the G-buffer, vs_bbd2d927: particles) look up the light-probe
+/// tetrahedron of every vertex with a walk from a start cell to the neighbour across the most
+/// negative barycentric coordinate, bounded only by the number of cells (15167 in the first
+/// district). A NaN position is inside no cell, so those vertices walk to the bound: about
+/// 15000 dependent buffer loads each, 2 - 3 ms of GPU time per draw whatever the resolution,
+/// for primitives the clipper then throws away. The module's words are edited so that a
+/// non-finite probe-space position leaves the walk after one cell. Finite vertices are untouched
+/// (their walks take 20 - 70 cells). Matched by size and FNV-1a like the SSR dither below, so
+/// another GPU's SPIR-V keeps the game's.
+struct ProbeWalkPatch {
+    size_t words;           ///< the original module's size
+    u64 fnv;                ///< FNV-1a 64 over its bytes
+    u32 insert_at;          ///< word index of the OpBranch into the loop header
+    u32 limit_at;           ///< word index of the walk's step limit (operand of OpULessThan)
+    u32 limit_id;           ///< the id found there
+    u32 type_bool, type_u32, type_f32;
+    u32 const_one;          ///< OpConstant %u32 1
+    std::array<u32, 3> pos; ///< ids of the probe-space position
+};
+
+constexpr std::array<ProbeWalkPatch, 2> ProbeWalkPatches{{
+    {10280, 0xb0005c73dfb93d89ull, 3606, 3706, 184, 3, 10, 8, 29, {403, 405, 407}},
+    {13734, 0x3e6652c353f4b2b9ull, 5919, 6019, 760, 3, 10, 8, 29, {785, 788, 791}},
+}};
+
+u64 Fnv1a64(std::span<const u32> code) {
+    u64 h = 0xcbf29ce484222325ull;
+    for (const u32 w : code) {
+        for (u32 b = 0; b < 4; ++b) {
+            h ^= (w >> (8 * b)) & 0xffu;
+            h *= 0x100000001b3ull;
+        }
+    }
+    return h;
+}
+
+/// Returns true when `code` is one of the two probe-walk shaders and `out` holds the edit.
+bool PatchProbeWalk(std::span<const u32> code, std::vector<u32>& out) {
+    for (const auto& p : ProbeWalkPatches) {
+        if (code.size() != p.words || code[p.limit_at] != p.limit_id || Fnv1a64(code) != p.fnv) {
+            continue;
+        }
+        const u32 n = code[3]; // the id bound: six new ids
+        constexpr u32 OpFAdd = 129, OpIsNan = 156, OpIsInf = 157, OpLogicalOr = 166,
+                      OpSelect = 169;
+        const std::array<u32, 29> walk_limit{
+            // sum = x + y + z: non-finite when any of them is
+            (5u << 16) | OpFAdd, p.type_f32, n, p.pos[0], p.pos[1],
+            (5u << 16) | OpFAdd, p.type_f32, n + 1, n, p.pos[2],
+            (4u << 16) | OpIsNan, p.type_bool, n + 2, n + 1,
+            (4u << 16) | OpIsInf, p.type_bool, n + 3, n + 1,
+            (5u << 16) | OpLogicalOr, p.type_bool, n + 4, n + 2, n + 3,
+            // limit = non-finite ? 1 : the game's
+            (6u << 16) | OpSelect, p.type_u32, n + 5, n + 4, p.const_one, p.limit_id,
+        };
+        out.clear();
+        out.reserve(code.size() + walk_limit.size());
+        out.insert(out.end(), code.begin(), code.begin() + p.insert_at);
+        out.insert(out.end(), walk_limit.begin(), walk_limit.end());
+        out.insert(out.end(), code.begin() + p.insert_at, code.end());
+        out[3] = n + 6;
+        out[p.limit_at + walk_limit.size()] = n + 5;
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
+bool ProbeWalkNanExitEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_PROBE_WALK_NAN_EXIT");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
 vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {
+    // SHADPS4_PROBE_WALK_NAN_EXIT (above): every path compiles these two modules here.
+    std::vector<u32> probe_walk;
+    if (ProbeWalkNanExitEnabled() && code.size() > 6019 && PatchProbeWalk(code, probe_walk))
+        [[unlikely]] {
+        static std::atomic<u32> logged{0}; // compile-pool threads call this too
+        if (logged.fetch_add(1) < 2) {
+            LOG_INFO(Render_Vulkan, "ProbeWalk: a non-finite position leaves the light-probe walk "
+                                    "({} words)",
+                     code.size());
+        }
+        code = probe_walk;
+    }
     // SHADPS4_SPIRV_SALT=<n> (diagnostic, 2026-10-07): writes n into the SPIR-V header's generator
     // word (informational only), so the driver's own shader cache misses and a run measures
     // first-time driver compiles without touching that cache.

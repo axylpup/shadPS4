@@ -1554,6 +1554,12 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
             if (fs->pgm_hash == 0x204f45fe && SsrDitherEnabled()) {
                 return "ssr dither";
             }
+            // SHADPS4_PROBE_WALK_NAN_EXIT edits these two plain modules by their exact SPIR-V
+            // as well.
+            if ((vs->pgm_hash == 0x3ab1ca58 || vs->pgm_hash == 0xbbd2d927) &&
+                ProbeWalkNanExitEnabled()) {
+                return "probe walk";
+            }
             for (u32 i = 0; i < stages.size(); ++i) {
                 if (stages[i] && i != u32(LogicalStage::Vertex) &&
                     i != u32(LogicalStage::Fragment)) {

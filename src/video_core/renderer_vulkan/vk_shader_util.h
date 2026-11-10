@@ -31,4 +31,8 @@ vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device);
 int SsrDitherMode();
 bool SsrDitherEnabled();
 
+/// SHADPS4_PROBE_WALK_NAN_EXIT=1: vs_3ab1ca58 / vs_bbd2d927 leave the light-probe walk for
+/// non-finite positions (vk_shader_util.cpp).
+bool ProbeWalkNanExitEnabled();
+
 } // namespace Vulkan
