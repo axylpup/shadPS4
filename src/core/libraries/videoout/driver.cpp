@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <cstdlib>
 
 #include "common/assert.h"
@@ -395,6 +396,15 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     };
 
     u32 vblank_hz = EmulatorSettings.GetVblankFrequency();
+    // An open panel (F3, the DLSS panel) asks for the last frame to be drawn again on a tick
+    // without a flip, so it stays usable while the game shows nothing new (loading, a pause).
+    // While the game is flipping that redraw only gets in the way: with the frame-rate cap
+    // above the game's rate (cap 75, game at 60) every fourth tick has no flip yet, the redraw
+    // takes the presenter and the next frame is late, which leaves more ticks without a flip -
+    // the game fell from 60 to 8 - 9 FPS for as long as a panel was open. So only when no
+    // frame has come for a while.
+    constexpr auto RedrawAfter = std::chrono::milliseconds{100};
+    auto last_flip = std::chrono::steady_clock::now();
     while (!token.stop_requested()) {
         // F3 -> Vblank Frequency applies live (user 10-21): the tick follows the setting.
         if (const u32 hz = EmulatorSettings.GetVblankFrequency(); hz != vblank_hz) [[unlikely]] {
@@ -418,12 +428,14 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
                         DrawBlankFrame();
-                    } else if (ImGui::Core::MustKeepDrawing()) {
+                    } else if (ImGui::Core::MustKeepDrawing() &&
+                               std::chrono::steady_clock::now() - last_flip >= RedrawAfter) {
                         DrawLastFrame();
                     }
                 }
             } else {
                 Flip(request);
+                last_flip = std::chrono::steady_clock::now();
                 FRAME_END;
             }
         }
