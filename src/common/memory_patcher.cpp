@@ -57,11 +57,20 @@ void AddEbootSegment(uintptr_t address, uint64_t size) {
     g_eboot_segments.emplace_back(address, size);
 }
 
-static bool EbootRangeLoaded(u64 offset, u64 size) {
+bool EbootRangeLoaded(u64 offset, u64 size) {
     const uintptr_t begin = g_eboot_address + offset;
     return std::ranges::any_of(g_eboot_segments, [&](const auto& s) {
         return begin >= s.first && begin + size <= s.first + s.second;
     });
+}
+
+bool EbootRangeIsCode(u64 offset, u64 size) {
+    if (g_eboot_segments.empty()) {
+        return false;
+    }
+    const uintptr_t begin = g_eboot_address + offset;
+    const auto& code = g_eboot_segments.front();
+    return begin >= code.first && begin + size <= code.first + code.second;
 }
 
 static bool DetectEboot107() {

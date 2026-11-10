@@ -195,6 +195,7 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
             {"hotkey_mouse_aim_faster", "equals"},
             {"hotkey_stick_smoothing", "f1"},
             {"hotkey_spray_tilt", "z"},
+            {"hotkey_cheats_panel", "f6"},
         };
         std::string legacy_capture_binding;
         bool legacy_capture_binding_found = false;
@@ -250,6 +251,7 @@ constexpr std::array<EmuKeyName, static_cast<size_t>(EmuKey::Count)> emu_key_nam
     {"hotkey_mouse_aim_faster", SDLK_EQUALS},
     {"hotkey_stick_smoothing", SDLK_F1},
     {"hotkey_spray_tilt", SDLK_Z},
+    {"hotkey_cheats_panel", SDLK_F6},
 }};
 constexpr u32 EmuKeyNone = ~0u; // "none" in the config; 0 = the default key
 std::array<std::atomic<u32>, static_cast<size_t>(EmuKey::Count)> emu_keys{};
