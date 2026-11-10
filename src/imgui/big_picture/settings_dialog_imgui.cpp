@@ -451,9 +451,22 @@ void SettingsWindow::DrawMainContent(bool* open, const std::function<void()>& ap
 
     // Align buttons right
     float buttonsWidth = ImGui::CalcTextSize("Save").x + ImGui::CalcTextSize("Cancel").x +
-                         ImGui::CalcTextSize("Apply").x + ImGui::GetStyle().FramePadding.x * 6.0f +
-                         ImGui::GetStyle().ItemSpacing.x * 2;
+                         ImGui::CalcTextSize("Apply").x + ImGui::CalcTextSize("Quit game").x +
+                         ImGui::GetStyle().FramePadding.x * 8.0f +
+                         ImGui::GetStyle().ItemSpacing.x * 3;
     ImGui::SetCursorPosX(ImGui::GetWindowContentRegionMax().x - buttonsWidth);
+
+    // Quit game: closes this menu and asks the quit hotkey's question ("Are you sure you want
+    // to quit?"), for players without Ctrl+Shift+End at hand (a streaming client, a controller).
+    if (ImGui::Button("Quit game")) {
+        DeInit();
+        *open = false;
+        if (applySettings) {
+            applySettings(); // as Cancel: unsaved changes are dropped
+        }
+        Overlay::ToggleQuitWindow();
+    }
+    ImGui::SameLine();
 
     if (ImGui::Button("Save")) {
         closeOnSave = true;
