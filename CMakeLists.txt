@@ -836,6 +836,8 @@ set(COMMON src/common/logging/classes.h
            src/common/ntapi.cpp
            src/common/number_utils.h
            src/common/number_utils.cpp
+           src/common/cheats.cpp
+           src/common/cheats.h
            src/common/memory_patcher.h
            src/common/memory_patcher.cpp
            ${CMAKE_CURRENT_BINARY_DIR}/src/common/scm_rev.cpp
@@ -1217,6 +1219,8 @@ set(IMGUI src/imgui/imgui_config.h
           src/imgui/big_picture/settings_dialog_imgui.h
           src/imgui/big_picture/settings_dialog_layer.cpp
           src/imgui/big_picture/settings_dialog_layer.h
+          src/imgui/cheats_panel.cpp
+          src/imgui/cheats_panel.h
           src/imgui/dlss5_panel.cpp
           src/imgui/dlss5_panel.h
           src/imgui/big_picture/imgui_impl_sdl3_big_picture.cpp

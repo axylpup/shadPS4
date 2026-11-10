@@ -6,6 +6,7 @@
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
+#include "common/cheats.h"
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
@@ -375,6 +376,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                 MemoryPatcher::AddEbootSegment(info.segments[i].address, info.segments[i].size);
             }
             MemoryPatcher::OnGameLoaded();
+            Cheats::OnGameLoaded(); // user/cheats, after the build's own patches
         }
     }
 }

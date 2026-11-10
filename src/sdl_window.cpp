@@ -25,6 +25,7 @@
 #include "core/libraries/system/userservice.h"
 #include "core/mouse_aim.h"
 #include "imgui/big_picture/settings_dialog_layer.h"
+#include "imgui/cheats_panel.h"
 #include "imgui/dlss5_panel.h"
 #include "core/user_settings.h"
 #include "imgui/friends_layer.h"
@@ -246,7 +247,8 @@ void WindowSDL::WaitEvent() {
     {
         static bool saved = false;
         static Input::MouseMode before = Input::MouseMode::Off;
-        const bool open = ImGuiEmuSettings::IsInGameSettingsDialogOpen() || Dlss5Panel::IsOpen();
+        const bool open = ImGuiEmuSettings::IsInGameSettingsDialogOpen() ||
+                          Dlss5Panel::IsOpen() || CheatsPanel::IsOpen();
         if (open && !saved) {
             before = Input::GetMouseMode();
             if (before != Input::MouseMode::Off) {
@@ -324,6 +326,14 @@ void WindowSDL::WaitEvent() {
             LOG_INFO(Render_Vulkan, "DLSS 5: {} (End)", on ? "on" : "off");
             Overlay::ShowNotice(on ? "DLSS 5: ON" : "DLSS 5: OFF (DLSS 4.5 only)");
         }
+        return;
+    }
+
+    // The cheats panel (F6, common/cheats.h): before ImGui for the same reason, so the key
+    // closes it as well.
+    if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+        emu_key(Input::EmuKey::CheatsPanel) && !(event.key.mod & SDL_KMOD_CTRL)) {
+        CheatsPanel::Toggle();
         return;
     }
 

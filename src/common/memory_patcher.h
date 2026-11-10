@@ -22,6 +22,10 @@ extern uintptr_t g_eboot_scratch;
 /// One loaded segment of the eboot (module.cpp, before OnGameLoaded): the built-in patches check
 /// their 01.07 offsets against these before reading (GitHub #22).
 void AddEbootSegment(uintptr_t address, uint64_t size);
+/// Cheats (common/cheats.h): whether [offset, offset + size) of the eboot image is loaded, and
+/// whether it lies in its first segment (the code).
+bool EbootRangeLoaded(u64 offset, u64 size);
+bool EbootRangeIsCode(u64 offset, u64 size);
 extern std::string g_game_serial;
 extern std::string patch_file;
 

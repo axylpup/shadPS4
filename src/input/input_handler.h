@@ -362,6 +362,7 @@ enum class EmuKey : u8 {
     MouseAimFaster,
     StickSmoothing,
     SprayTilt,
+    CheatsPanel,
     Count,
 };
 u32 GetEmuKey(EmuKey key);
