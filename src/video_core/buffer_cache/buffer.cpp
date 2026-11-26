@@ -72,6 +72,16 @@ RequireVideoMemory::~RequireVideoMemory() {
     t_require_video = false;
 }
 
+static thread_local bool t_prefer_host = false;
+
+PreferHostMemory::PreferHostMemory() {
+    t_prefer_host = true;
+}
+
+PreferHostMemory::~PreferHostMemory() {
+    t_prefer_host = false;
+}
+
 /// RequireVideoMemory: device-local memory types only, VMA's budget estimate skipped.
 static void RequireVideo(VmaAllocationCreateInfo& ci) {
     ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
@@ -130,6 +140,17 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
                         buffer_ci.size >> 20, vk::to_string(vk::Result{result}),
                         Vulkan::DescribeDeviceLocalBudgets(allocator));
         }
+    }
+    if (result != VK_SUCCESS && t_prefer_host && usage == MemoryUsage::DeviceLocal) {
+        // No room in video memory (BIG_GROW's mesh buffer on a small card): host memory instead
+        // of an out-of-memory assert. The buffer stays device-addressable; reads over PCIe are
+        // slow, so this is a fallback, not a preference.
+        alloc_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        alloc_ci.preferredFlags |= VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        LOG_WARNING(Render_Vulkan,
+                    "A {} MB buffer does not fit in video memory: trying system memory (slower); "
+                    "{}",
+                    buffer_ci.size >> 20, Vulkan::DescribeDeviceLocalBudgets(allocator));
     }
     if (result != VK_SUCCESS) {
         // v1.0.2: over VMA's budget, retry without it (vk_memory_budget.h) instead of asserting.

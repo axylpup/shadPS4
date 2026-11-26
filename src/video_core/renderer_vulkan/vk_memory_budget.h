@@ -36,6 +36,16 @@ inline bool AllowOverBudget() {
     return on;
 }
 
+/// SHADPS4_MESH_HOST_FALLBACK=0: BIG_GROW's mesh buffer refuses system memory and asserts as it
+/// did before (for measuring the fallback's cost).
+inline bool AllowMeshHostFallback() {
+    static const bool on = [] {
+        const char* e = std::getenv("SHADPS4_MESH_HOST_FALLBACK");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
 /// VMA's view of every device-local heap: "heap i: usage / budget MB (n allocations)".
 inline std::string DescribeDeviceLocalBudgets(VmaAllocator allocator) {
     const VkPhysicalDeviceMemoryProperties* props{};

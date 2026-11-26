@@ -133,6 +133,74 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
                       DEFAULT_CRITICAL_GC_MEMORY));
     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
+
+    base_trigger_gc_memory = trigger_gc_memory;
+    base_pressure_gc_memory = pressure_gc_memory;
+    base_critical_gc_memory = critical_gc_memory;
+    card_budget_memory = static_cast<u64>(device_local_memory);
+    if (const char* p = std::getenv("SHADPS4_VRAM_AUTO"); p && p[0] == '1') {
+        auto_gc_budget = true;
+    }
+    if (const char* p = std::getenv("SHADPS4_VRAM_BUDGET_MB"); p && *p) {
+        forced_gc_budget = std::strtoull(p, nullptr, 10) << 20;
+    }
+    RefreshGcLimits();
+    LOG_INFO(Render_Vulkan,
+             "Texture cache: {} MB budget, automatic={}, fixed={} MB, device guard={} MB, "
+             "trigger={} MB, pressure={} MB, critical={} MB",
+             device_local_memory >> 20, auto_gc_budget, forced_gc_budget >> 20,
+             device_guard_memory >> 20, trigger_gc_memory >> 20, pressure_gc_memory >> 20,
+             critical_gc_memory >> 20);
+}
+
+bool TextureCache::ImageBudgetMode() const {
+    return auto_gc_budget || forced_gc_budget != 0;
+}
+
+void TextureCache::RefreshGcLimits() {
+    // The driver's budget now: lower than at startup when other programs hold VRAM, and the
+    // only meaningful one on integrated GPUs.
+    const u64 now = instance.GetDeviceMemoryBudgetNow();
+    const u64 card = now != 0 ? now : card_budget_memory;
+    trigger_gc_memory = base_trigger_gc_memory;
+    pressure_gc_memory = base_pressure_gc_memory;
+    critical_gc_memory = base_critical_gc_memory;
+    // Usage counts every allocation (buffers, swapchain, staging), not only images: on smaller
+    // discrete cards keep a headroom free whatever the budget says.
+    device_guard_memory = card / 100 * 95;
+    if (!instance.IsIntegrated() && card <= u64(SMALL_CARD_MEMORY)) {
+        static const u64 headroom = [] {
+            const char* p = std::getenv("SHADPS4_VRAM_HEADROOM_MB");
+            return u64(p ? std::strtoull(p, nullptr, 10) : 768) << 20;
+        }();
+        device_guard_memory = std::max<u64>(card > headroom ? card - headroom : 0, card / 2);
+    }
+    u64 budget = forced_gc_budget ? std::min(forced_gc_budget, card) : 0;
+    // SHADPS4_VRAM_AUTO=1: the textures get what the device guard leaves after everything else
+    // (buffers, staging, swapchain, the driver), measured now: any card, other programs' VRAM
+    // included. 512 MB at least.
+    if (auto_gc_budget && instance.CanReportMemoryUsage()) {
+        const u64 usage = instance.GetDeviceMemoryUsage();
+        const u64 others = usage > image_bytes ? usage - image_bytes : 0;
+        auto_budget_memory = std::max<u64>(
+            device_guard_memory > others ? device_guard_memory - others : 0, 512ull << 20);
+        budget = auto_budget_memory;
+    }
+    if (budget == 0 && instance.IsIntegrated()) {
+        budget = card;
+    }
+    if (budget != 0) {
+        trigger_gc_memory = budget / 10 * 7;
+        pressure_gc_memory = budget / 100 * 85;
+        critical_gc_memory = budget / 100 * 95;
+    }
+    // In image budget mode the limits apply to the images alone and the guard above to the
+    // device; otherwise both are the device's usage.
+    if (!ImageBudgetMode()) {
+        critical_gc_memory = std::min(critical_gc_memory, device_guard_memory);
+    }
+    pressure_gc_memory = std::min(pressure_gc_memory, critical_gc_memory);
+    trigger_gc_memory = std::min(trigger_gc_memory, pressure_gc_memory);
 }
 
 TextureCache::~TextureCache() {
@@ -1881,6 +1949,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.flags |= ImageFlagBits::Registered;
     LogImageChurn("Register", image);
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
+    image_bytes += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     std::atomic_ref<u64>{image.gc_touch}.store(gc_tick, std::memory_order_relaxed);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
@@ -1906,6 +1975,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     LogImageChurn("Unregister", image);
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
+    image_bytes -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         const auto page_it = page_table.find(page);
         if (page_it == nullptr) {
@@ -2054,7 +2124,22 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 
 void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
+        const u64 device = instance.GetDeviceMemoryUsage();
+        // The driver's budget moves while the game runs (other programs, the arena growing):
+        // follow it about once a second.
+        if (gc_tick % 60 == 0) {
+            RefreshGcLimits();
+        }
+        total_used_memory = device;
+        if (ImageBudgetMode()) {
+            // The images against the budget; the device's usage only escalates.
+            total_used_memory = image_bytes;
+            if (device >= device_guard_memory) {
+                total_used_memory = std::max(total_used_memory, critical_gc_memory);
+            } else if (device + (512ull << 20) >= device_guard_memory) {
+                total_used_memory = std::max(total_used_memory, pressure_gc_memory);
+            }
+        }
     }
     if (total_used_memory < trigger_gc_memory) {
         return;

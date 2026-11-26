@@ -124,6 +124,18 @@ public:
     RequireVideoMemory& operator=(const RequireVideoMemory&) = delete;
 };
 
+/// The opposite of RequireVideoMemory: while one is alive on this thread, a DeviceLocal buffer is
+/// allocated in host memory (VMA's AUTO_PREFER_HOST). Used for BIG_GROW's mesh buffer when the
+/// driver's budget has no room for it in video memory: reads over PCIe are slow, an out-of-memory
+/// assert ends the game (RTX 3050 Laptop 4 GB, 2.7 GB mesh buffer, 2026-10-27).
+class PreferHostMemory {
+public:
+    PreferHostMemory();
+    ~PreferHostMemory();
+    PreferHostMemory(const PreferHostMemory&) = delete;
+    PreferHostMemory& operator=(const PreferHostMemory&) = delete;
+};
+
 class Buffer {
 public:
     explicit Buffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,

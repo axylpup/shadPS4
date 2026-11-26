@@ -41,6 +41,8 @@ class TextureCache {
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
     static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
     static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
+    // Cards up to this size keep a fixed headroom free for buffers/staging (see RefreshGcLimits).
+    static constexpr s64 SMALL_CARD_MEMORY = 12_GB;
 
     using ImageIds = boost::container::small_vector<ImageId, 16>;
 
@@ -416,6 +418,11 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// Recomputes the collector limits from the driver's current budget (VK_EXT_memory_budget).
+    void RefreshGcLimits();
+    /// True when the texture cache, not the whole device, is measured against the budget.
+    bool ImageBudgetMode() const;
+
     /// SHADPS4_MEM_CENSUS (PERF-PLAN 11): guest bytes of the cached images by kind - render
     /// targets / depth (attachment usage) and the rest (textures). Takes the cache mutex.
     struct ImageCensus {
@@ -654,6 +661,22 @@ private:
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
+    /// Bytes of the registered images (total_used_memory is the whole device's usage).
+    u64 image_bytes = 0;
+    /// Limits computed at startup, before RefreshGcLimits applies the budget and the headroom.
+    u64 base_trigger_gc_memory = 0;
+    u64 base_pressure_gc_memory = 0;
+    u64 base_critical_gc_memory = 0;
+    /// The card's budget at startup; the fallback when the driver cannot report the current one.
+    u64 card_budget_memory = 0;
+    /// SHADPS4_VRAM_BUDGET_MB: fixed texture budget, 0 when unset.
+    u64 forced_gc_budget = 0;
+    /// SHADPS4_VRAM_AUTO=1: the texture budget follows the device (RefreshGcLimits).
+    bool auto_gc_budget = false;
+    /// The texture budget the automatic mode computed last (0 outside it).
+    u64 auto_budget_memory = 0;
+    /// Device usage above which the collector runs critical whatever the image bytes are.
+    u64 device_guard_memory = 0;
     u64 total_used_samplers = 0;
     u64 trigger_gc_samplers = 0;
     u64 pressure_gc_samplers = 0;

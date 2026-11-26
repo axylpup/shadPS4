@@ -1361,6 +1361,23 @@ u64 Instance::GetDeviceMemoryUsage() const {
     return total_usage;
 }
 
+u64 Instance::GetDeviceMemoryBudgetNow() const {
+    if (!supports_memory_budget) {
+        return 0;
+    }
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
+    vk::PhysicalDeviceMemoryProperties2 props = {
+        .pNext = &memory_budget_props,
+    };
+    physical_device.getMemoryProperties2(&props);
+
+    u64 total_budget = 0;
+    for (const size_t heap : valid_heaps) {
+        total_budget += memory_budget_props.heapBudget[heap];
+    }
+    return total_budget;
+}
+
 vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const {
     const auto it = format_properties.find(format);
     if (it == format_properties.end()) {

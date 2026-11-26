@@ -7281,6 +7281,12 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
             }
         }
     }
+    // SHADPS4_MESH_MAX_MB (test / small cards): a hard cap on the mesh buffer size, applied
+    // before the fit probe, so a 4 GB card can ask for less than its 2.75 GB tier.
+    static const u64 mesh_cap = [] {
+        const char* m = std::getenv("SHADPS4_MESH_MAX_MB");
+        return m ? std::strtoull(m, nullptr, 10) << 20 : 0ull;
+    }();
     // The one mesh buffer BIG_GROW creates at the first big join; its size is chosen once from
     // the video memory size (0 = BIG_GROW off).
     static const u64 big_grow_bytes = [this]() -> u64 {
@@ -7355,6 +7361,11 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
                    : max_alloc >= 0xB0000000ull ? 0xB0000000ull
                                                  : std::min<u64>(size, 0xC0000000ull);
         }
+        // SHADPS4_MESH_MAX_MB (test / small cards): a hard cap on the mesh buffer size, applied
+        // before the fit probe, so a 4 GB card can ask for less than its 2.75 GB tier.
+        if (mesh_cap != 0 && size > mesh_cap) {
+            size = mesh_cap;
+        }
         LOG_INFO(Render_Vulkan,
                  "BIG_GROW: largest device-local heap {} MiB{} (3.75 GB needs >= {} MiB and >= 24 GB "
                  "RAM, RAM {} MB, tiers {}), max allocation {} MiB -> {} MB{}",
@@ -7365,9 +7376,15 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         return size;
     }();
     const bool big_grow = big_grow_bytes != 0;
+    // Any join of >= 1 GB is the mesh memory, BIG_GROW on or off: CreateBuffer gives it video
+    // memory when it fits and system memory when it does not (see MeshFitsVideo).
+    const bool mesh_join = !overlap_ids.empty() && end - begin >= (1ull << 30);
+    if (mesh_join) {
+        mesh = true;
+    }
     // r15e: only joins of >= 1 GB (the mesh memory) - growing the 542 MB heap buffer over the
     // particle arena put CPU-written pages under tracking: write faults 35 k -> 57-60 k/s (s1051-s1056).
-    if (big_grow && !overlap_ids.empty() && end - begin >= (1ull << 30)) {
+    if (big_grow && mesh_join) {
         // r15 SHADPS4_BIG_GROW=1 (2026-10-14): a join that yields a buffer of >= 256 MB is sized
         // ahead by max(768 MB, 50%) (clamped to mapped guest memory, under 4 GB). The game's mesh
         // memory (~2-2.5 GB at 0x271258000) grows as blocks stream in; each growth re-created it
@@ -7412,6 +7429,9 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
             }
             const auto& mp = instance.GetMemoryProperties();
             for (const u64 size : sizes) {
+                if (mesh_cap != 0 && size > mesh_cap) {
+                    continue;
+                }
                 const u64 ask = size > fail_above ? (64ull << 30) : size;
                 // 1.1.1 (GitHub #30, RX 5600 XT 6 GB): the probe used to count any heap as a fit -
                 // VMA's budget is its own 80%-of-heap estimate (4697 of 5872 MiB), so the 2816 MB
@@ -7451,8 +7471,21 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
             return 0;
         }();
         const u64 mapped = memory->TryClampRangeSize(begin, want);
-        VAddr grow_end = Common::AlignDown(begin + mapped, CACHING_PAGESIZE);
-        if (mapped > cur && grow_end > end) {
+        // SHADPS4_MESH_HEADROOM_MB (default 256 MB): the game's mesh accesses walk a few pages past
+        // the joined range (observed 2790 -> 2792 MB in two 80-96 KB steps). Each such step made
+        // FindBuffer reject the old buffer and recreated/copy the whole ~2.8 GB mesh into a second
+        // host allocation; three 2.8 GB buffers in system RAM was enough to OOM a 16 GB PC. Grow
+        // once past the requested range, within mapped guest memory, so those tail writes land
+        // inside the existing buffer. A big buffer at the boundary still stops the extension.
+        static const u64 mesh_headroom = [] {
+            const char* h = std::getenv("SHADPS4_MESH_HEADROOM_MB");
+            return h ? std::strtoull(h, nullptr, 10) << 20 : (256ull << 20);
+        }();
+        const u64 target = std::max(mapped, cur + mesh_headroom);
+        const u64 clamped = memory->TryClampRangeSize(begin, target);
+        VAddr grow_end =
+            Common::AlignDown(begin + (clamped != 0 ? clamped : mapped), CACHING_PAGESIZE);
+        if (grow_end > end) {
             // r15b: the extension stops at the next existing buffer (s1043: the 542 MB heap buffer
             // grew into the mesh buffer and merged with it - a 3 GB copy and one 3.6 GB buffer
             // holding the CPU-written heap too, rooftop -2.7%).
@@ -7460,25 +7493,34 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
             // copies; s1047 / s1050: stopping at them pushed the growth into the scene, where the
             // coherent upload of the extension stalled 1.0-1.2 s); a big one ends the extension.
             boost::container::small_vector<BufferId, 16> extra;
-            for (VAddr a = Common::AlignUp(end, CACHING_PAGESIZE); a < grow_end;
-                 a += CACHING_PAGESIZE) {
-                const BufferId id = page_table[a >> CACHING_PAGEBITS].buffer_id;
-                if (!id || slot_buffers[id].is_picked) {
-                    continue;
+            // Walk the buffer ranges, not 4 KB pages: a 256 MB headroom is 65,536 page_table
+            // lookups (measured 141 ms of CPU on the command processor). buffer_ranges is the
+            // same ownership map ChangeRegister maintains, so the result is identical - it just
+            // visits each buffer once instead of every page inside it.
+            bool stopped = false;
+            ForEachBufferInRange(end, grow_end - end, [&](BufferId id, Buffer& o) {
+                if (stopped || !id || slot_buffers[id].is_picked) {
+                    return;
                 }
-                Buffer& o = slot_buffers[id];
                 if (o.SizeBytes() >= (64ull << 20) || o.CpuAddr() < end) {
                     grow_end = Common::AlignDown(o.CpuAddr(), CACHING_PAGESIZE);
-                    break;
+                    stopped = true;
+                    return;
                 }
                 o.is_picked = true;
                 extra.push_back(id);
                 grow_end = std::max<VAddr>(grow_end, o.CpuAddr() + o.SizeBytes());
-            }
+            });
             if (grow_end > end && grow_end - begin < 0xFFFF0000ull) {
+                const u64 old_size = end - begin;
                 overlap_ids.insert(overlap_ids.end(), extra.begin(), extra.end());
                 end = grow_end;
                 ++big_grow_count;
+                LOG_INFO(Render_Vulkan,
+                         "BIG_GROW: extended mesh buffer {} -> {} MB ({} MB headroom, {} small "
+                         "buffers absorbed), tick {}",
+                         old_size >> 20, (end - begin) >> 20, (end - begin - old_size) >> 20,
+                         extra.size(), scheduler.CurrentTick());
             } else {
                 for (const BufferId id : extra) {
                     slot_buffers[id].is_picked = false;
@@ -7583,14 +7625,27 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
     }
     // 1.1.1 (GitHub #30): BIG_GROW's mesh buffer goes to video memory whenever the driver's budget
     // has room for it now (the joined buffers still alive), not where VMA's estimate sends it.
+    // 1.1.1 (RTX 3050 Laptop 4 GB, 2026-10-27): when it does not fit, the mesh buffer still has to
+    // exist - put it in system memory instead of asserting out of video memory.
     std::optional<RequireVideoMemory> video;
-    if (overlap.mesh && MeshFitsVideo(instance, size, big_copy).value_or(false)) {
-        video.emplace();
+    std::optional<PreferHostMemory> host;
+    if (overlap.mesh) {
+        const std::optional<bool> fits = MeshFitsVideo(instance, size, big_copy);
+        if (fits.value_or(false)) {
+            video.emplace();
+        } else if (fits.has_value() && Vulkan::AllowMeshHostFallback()) {
+            host.emplace();
+            LOG_WARNING(Render_Vulkan,
+                        "BIG_GROW: the {} MB mesh buffer does not fit in video memory; allocating "
+                        "it in system memory (slower); {}",
+                        size >> 20, Vulkan::DescribeDriverBudgets(instance.GetAllocator()));
+        }
     }
     const BufferId new_buffer_id =
         slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
                             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
     video.reset();
+    host.reset();
     auto& new_buffer = slot_buffers[new_buffer_id];
     new_buffer.memo_serial = ++buffer_memo_serial;
     for (const BufferId overlap_id : overlap.ids) {

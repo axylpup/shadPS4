@@ -533,6 +533,10 @@ public:
     /// Returns the amount of memory used.
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
 
+    /// The driver's current budget (VK_EXT_memory_budget): what this process may use now. Lower
+    /// than at startup while other programs hold video memory. 0 when unsupported.
+    [[nodiscard]] u64 GetDeviceMemoryBudgetNow() const;
+
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {
         return total_memory_budget;
